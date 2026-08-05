@@ -464,11 +464,27 @@ def main(
             #     agent.publish_low_state(info["proprio"])
 
             if agent.reset_requested:
-                # Discard any in-progress recording
+                # Save any in-progress recording before reset.
                 if exporter is not None and rec_state == RecordingState.RECORDING:
-                    print("[Record] Reset requested, discarding in-progress episode")
-                    exporter.skip_and_start_new_episode()
-                    # Close progress bar for discarded episode
+                    episode_size = int(exporter.episode_buffer.get("size", 0))
+                    if episode_size > 0:
+                        print(
+                            "[Record] Reset requested, saving in-progress episode "
+                            f"with {episode_size} frames"
+                        )
+                        ep_idx = exporter.episode_buffer["episode_index"]
+                        exporter.save_episode()
+                        _save_episode_env_config(exporter, task, ep_idx)
+                        episodes_saved += 1
+                        agent.episodes_saved = episodes_saved
+                        print(f"[Record] Episode {episodes_saved} saved (manual reset)")
+                        if episodes_saved >= num_episodes:
+                            print(f"[Record] Reached {num_episodes} episodes, stopping")
+                            break
+                    else:
+                        print("[Record] Reset requested before first recorded frame, skipping empty episode")
+                        exporter.skip_and_start_new_episode()
+
                     if step_pbar is not None:
                         step_pbar.close()
                         step_pbar = None
