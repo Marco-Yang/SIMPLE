@@ -299,6 +299,7 @@ def main(
     if robot_sim_dt is None:
         robot_sim_dt = sonic_config["SIMULATE_DT"]
     control_dt = control_decimal * robot_sim_dt  # = 0.02 s (50 Hz)
+    record_every_n = max(1, int(os.getenv("SIMPLE_RECORD_EVERY_N", "1")))
 
     def _on_episode_reset():
         """In recording mode, reset the WBC pipeline to a consistent initial pose,
@@ -428,10 +429,12 @@ def main(
                             print("[Record] Teleop active, starting episode recording")
 
                     if rec_state == RecordingState.RECORDING:
-                        frame = _build_frame(agent, obj_names, **data_frame)
-                        exporter.add_frame(frame)
-                        if step_pbar is not None:
-                            step_pbar.update(1)
+                        # Optional frame decimation to reduce recording overhead.
+                        if sim_cnt % record_every_n == 0:
+                            frame = _build_frame(agent, obj_names, **data_frame)
+                            exporter.add_frame(frame)
+                            if step_pbar is not None:
+                                step_pbar.update(1)
 
                         # Track initial target height
                         if initial_target_z is None and "target" in privileged_info:
