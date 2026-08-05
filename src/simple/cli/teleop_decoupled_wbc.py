@@ -299,7 +299,34 @@ def main(
     if robot_sim_dt is None:
         robot_sim_dt = sonic_config["SIMULATE_DT"]
     control_dt = control_decimal * robot_sim_dt  # = 0.02 s (50 Hz)
-    record_every_n = max(1, int(os.getenv("SIMPLE_RECORD_EVERY_N", "1")))
+    low_latency_mode = os.getenv("SIMPLE_LOW_LATENCY_MODE", "0") == "1"
+
+    record_every_n = max(
+        1,
+        int(os.getenv("SIMPLE_RECORD_EVERY_N", "2" if low_latency_mode else "1")),
+    )
+    viewer_every_n = max(
+        1,
+        int(os.getenv("SIMPLE_VIEWER_EVERY_N", "3" if low_latency_mode else "1")),
+    )
+    stream_every_n = max(
+        1,
+        int(os.getenv("SIMPLE_STREAM_EVERY_N", "2" if low_latency_mode else "1")),
+    )
+    update_reward_enabled = os.getenv(
+        "SIMPLE_UPDATE_REWARD", "0" if low_latency_mode else "1"
+    ) == "1"
+    viewer_enabled = os.getenv("SIMPLE_VIEWER_ENABLE", "1") == "1"
+    stream_enabled = os.getenv("SIMPLE_STREAM_ENABLE", "1") == "1"
+    perf_log_interval = float(os.getenv("SIMPLE_PERF_LOG_INTERVAL_SECS", "5.0"))
+    overrun_log_interval = float(
+        os.getenv(
+            "SIMPLE_OVERRUN_LOG_INTERVAL_SECS",
+            os.getenv("SIMPLE_OVERUN_LOG_INTERVAL_SECS", "2.0"),
+        )
+    )
+    last_overrun_log_ts = 0.0
+    last_perf_log_ts = time.monotonic()
 
     def _on_episode_reset():
         """In recording mode, reset the WBC pipeline to a consistent initial pose,
@@ -343,6 +370,15 @@ def main(
         else:
             print("\n[Record] Exporter unavailable; run will continue without dataset export.")
 
+    print(
+        "[Perf] loop tuning: "
+        f"low_latency_mode={low_latency_mode}, viewer_every_n={viewer_every_n}, "
+        f"stream_every_n={stream_every_n}, record_every_n={record_every_n}, "
+        f"update_reward={update_reward_enabled}, viewer_enabled={viewer_enabled}, "
+        f"stream_enabled={stream_enabled}, "
+        f"perf_log_interval={perf_log_interval}s"
+    )
+
     try:
         while True:
             step_start = time.monotonic()
@@ -385,14 +421,16 @@ def main(
                 print("[TeleopDecoupled] Environment reset complete")
 
             with telemetry.timer("update_viewer"):
-                if not headless:
+                if viewer_enabled and (not headless) and (sim_cnt % viewer_every_n == 0):
                     sonic_env.update_viewer()
 
             with telemetry.timer("update_reward"):
-                sonic_env.update_reward()
+                if update_reward_enabled:
+                    sonic_env.update_reward()
 
             with telemetry.timer("update_render"):
-                agent.update_render_caches(observation)
+                if stream_enabled and sim_cnt % stream_every_n == 0:
+                    agent.update_render_caches(observation)
 
             """ # --- Print once when robot first stabilizes ---
             if robot.stabilized and not stabilized_printed:
@@ -482,9 +520,24 @@ def main(
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
-                # Only show timing when loop is slow and verbose_timing is disabled
-                telemetry.log_timing_info(context=f"{sim_cnt: >3}: Control loop overran by {-sleep_time:.3f} seconds", threshold=0.001)
+                # Throttle overrun logs to avoid heavy stdout overhead in slow loops.
+                now = time.monotonic()
+                if now - last_overrun_log_ts >= overrun_log_interval:
+                    last_overrun_log_ts = now
+                    telemetry.log_timing_info(
+                        context=f"{sim_cnt: >3}: Control loop overran by {-sleep_time:.3f} seconds",
+                        threshold=0.001,
+                    )
                 # ...
+
+            now = time.monotonic()
+            if perf_log_interval > 0 and (now - last_perf_log_ts) >= perf_log_interval:
+                last_perf_log_ts = now
+                telemetry.log_timing_info(
+                    context=f"{sim_cnt: >3}: Periodic perf summary",
+                    threshold=10.0,
+                    log_averages=True,
+                )
 
             sim_cnt += 1
     except KeyboardInterrupt:

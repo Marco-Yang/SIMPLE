@@ -36,6 +36,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self.episodes_saved = 0
         self.num_episodes = 100
         self.image_publish_process = None
+        self._stream_width = None
+        self._stream_height = None
         if sonic_cfg is None:
             sonic_cfg = getattr(self.robot, "sonic_config", None)
         if sonic_cfg is None:
@@ -116,6 +118,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
 
             ip = camera_req.get("ip")
             port = camera_req.get("port")
+            self._stream_width = width
+            self._stream_height = height
 
             print(
                 "[PicoDecoupled] Stream config: "
@@ -148,6 +152,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
             if self._streaming:
                 self._streaming.stop()
                 self._streaming = None
+            self._stream_width = None
+            self._stream_height = None
             tcp_server.close_client()
 
         tcp_server.on_open_camera = on_open_camera
@@ -301,9 +307,20 @@ class PicoDecoupledAgent(SonicWbcAgent):
         if getattr(self, "_pico_streamer", None) is None:
             return
         xr = self._pico_streamer.xr_client
+        latest = getattr(self._pico_streamer, "_latest_pico_data", None)
+
+        def _btn(name: str) -> bool:
+            if isinstance(latest, dict) and name in latest:
+                return bool(latest[name])
+            return bool(xr.get_button_state_by_name(name))
+
+        def _key(name: str) -> float:
+            if isinstance(latest, dict) and name in latest:
+                return float(latest[name])
+            return float(xr.get_key_value_by_name(name))
 
         # --- drop_robot: right joystick click (edge-triggered) ---
-        drop_btn = bool(xr.get_button_state_by_name("right_axis_click"))
+        drop_btn = _btn("right_axis_click")
         if drop_btn and not self._drop_btn_last:
             if (
                 self.robot.elastic_band
@@ -315,8 +332,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self._drop_btn_last = drop_btn
 
         # --- reset_env: left_grip + right_grip held simultaneously (edge) ---
-        left_grip = xr.get_key_value_by_name("left_grip") > 0.5
-        right_grip = xr.get_key_value_by_name("right_grip") > 0.5
+        left_grip = _key("left_grip") > 0.5
+        right_grip = _key("right_grip") > 0.5
         reset_btn = left_grip and right_grip
         if reset_btn and not self._reset_btn_last:
             self._reset_requested = True
@@ -341,16 +358,33 @@ class PicoDecoupledAgent(SonicWbcAgent):
             return
         left_bgr = np.ascontiguousarray(left[..., ::-1])
         right_bgr = np.ascontiguousarray(right[..., ::-1])
-        # Draw debug text on top-right of each eye
-        text = f"{self.episodes_saved}/{self.num_episodes}"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale, thickness = 1.0, 2
-        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-        x = left_bgr.shape[1] - tw - 100
-        y = th + 10
-        cv2.putText(left_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
-        cv2.putText(right_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+        if os.getenv("SIMPLE_PICO_STREAM_OVERLAY", "1") == "1":
+            # Draw debug text on top-right of each eye.
+            text = f"{self.episodes_saved}/{self.num_episodes}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale, thickness = 1.0, 2
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            x = left_bgr.shape[1] - tw - 100
+            y = th + 10
+            cv2.putText(left_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+            cv2.putText(right_bgr, text, (x, y), font, scale, (0, 255, 0), thickness)
+
         stereo = np.concatenate([left_bgr, right_bgr], axis=1)
+
+        # Keep producer frame size aligned with encoder config to avoid
+        # per-frame implicit scaling inside the codec path.
+        if (
+            os.getenv("SIMPLE_PICO_STREAM_RESIZE_TO_ENCODER", "1") == "1"
+            and self._stream_width is not None
+            and self._stream_height is not None
+            and (stereo.shape[1] != self._stream_width or stereo.shape[0] != self._stream_height)
+        ):
+            stereo = cv2.resize(
+                stereo,
+                (self._stream_width, self._stream_height),
+                interpolation=cv2.INTER_AREA,
+            )
+
         self._frame_buffer.put(stereo)
 
     # ------------------------------------------------------------------
