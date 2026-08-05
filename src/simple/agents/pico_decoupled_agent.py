@@ -61,6 +61,7 @@ class PicoDecoupledAgent(SonicWbcAgent):
         # Edge-detection state for button combos
         self._drop_btn_last = False
         self._reset_btn_last = False
+        self._reset_hold_start = None
 
         # --- Pico VR streaming (camera feed to headset) ---
         self._init_pico_streamer()
@@ -331,14 +332,37 @@ class PicoDecoupledAgent(SonicWbcAgent):
                 print("[PicoDecoupled] Controlled drop started (right stick click)")
         self._drop_btn_last = drop_btn
 
-        # --- reset_env: left_grip + right_grip held simultaneously (edge) ---
-        left_grip = _key("left_grip") > 0.5
-        right_grip = _key("right_grip") > 0.5
-        reset_btn = left_grip and right_grip
-        if reset_btn and not self._reset_btn_last:
-            self._reset_requested = True
-            print("[PicoDecoupled] Environment reset requested (L-grip + R-grip)")
-        self._reset_btn_last = reset_btn
+        # --- reset_env: strict combo only ---
+        # Reset is triggered only by left_menu + left_grip + right_grip held
+        # for a configured duration, while triggers are released and Y is not
+        # pressed. Any other combination must not trigger reset.
+        grip_threshold = float(os.getenv("SIMPLE_PICO_RESET_GRIP_THRESHOLD", "0.85"))
+        hold_secs = float(os.getenv("SIMPLE_PICO_RESET_HOLD_SECS", "2.00"))
+        trigger_max = float(os.getenv("SIMPLE_PICO_RESET_TRIGGER_MAX", "0.20"))
+        left_menu = _btn("left_menu_button")
+        left_grip = _key("left_grip") >= grip_threshold
+        right_grip = _key("right_grip") >= grip_threshold
+        left_trigger = _key("left_trigger")
+        right_trigger = _key("right_trigger")
+        triggers_clear = left_trigger <= trigger_max and right_trigger <= trigger_max
+        y_pressed = _btn("Y")
+        reset_combo = left_menu and left_grip and right_grip and triggers_clear and (not y_pressed)
+        now = time.monotonic()
+
+        if reset_combo:
+            if self._reset_hold_start is None:
+                self._reset_hold_start = now
+            held = now - self._reset_hold_start
+            if held >= hold_secs and not self._reset_btn_last:
+                self._reset_requested = True
+                self._reset_btn_last = True
+                print(
+                    "[PicoDecoupled] Environment reset requested "
+                    f"(left_menu + left_grip + right_grip hold={held:.2f}s, th={grip_threshold:.2f})"
+                )
+        else:
+            self._reset_hold_start = None
+            self._reset_btn_last = False
 
     # ------------------------------------------------------------------
     # Rendering / streaming
@@ -768,6 +792,11 @@ class PicoDecoupledAgent(SonicWbcAgent):
         if getattr(self, "_wbc_policy", None) is not None:
             try:
                 self._wbc_policy.reset(init_time=t_now)
+            except TypeError:
+                try:
+                    self._wbc_policy.reset()
+                except Exception as exc:
+                    print(f"[PicoDecoupled] WBC reset skipped: {exc}")
             except Exception as exc:
                 print(f"[PicoDecoupled] WBC reset skipped: {exc}")
 
@@ -792,6 +821,7 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self._last_teleop_action = {}
         self._pre_stabilize_loops = 0
         self._stabilize_bypass = False
+        self._auto_activate_attempted = False
 
     def publish_low_state(self, proprio):
         # No Unitree bridge needed — decoupled WBC reads from SIMPLE directly

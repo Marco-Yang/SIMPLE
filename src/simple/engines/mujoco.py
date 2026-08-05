@@ -159,6 +159,45 @@ class MujocoSimulator(Simulator):
         # https://mujoco.readthedocs.io/en/stable/computation/index.html
         # https://mujoco.readthedocs.io/en/stable/modeling.html#preventing-slip
         mjSpec = mujoco.MjSpec()
+
+        # Prevent arena-memory exhaustion in dense contact scenes (common in
+        # teleop reset phases). Defaults are conservative and can be overridden.
+        def _env_int(name: str, default: int) -> int:
+            raw = os.getenv(name, str(default)).strip().lower()
+            try:
+                if raw.endswith("mb"):
+                    return int(float(raw[:-2]) * 1024 * 1024)
+                if raw.endswith("m"):
+                    return int(float(raw[:-1]) * 1024 * 1024)
+                if raw.endswith("kb"):
+                    return int(float(raw[:-2]) * 1024)
+                if raw.endswith("k"):
+                    return int(float(raw[:-1]) * 1024)
+                return int(raw)
+            except Exception:
+                return default
+
+        mj_memory = max(0, _env_int("SIMPLE_MJ_MEMORY_BYTES", 64 * 1024 * 1024))
+        mj_nstack = _env_int("SIMPLE_MJ_NSTACK", -1)
+        mj_nconmax = _env_int("SIMPLE_MJ_NCONMAX", -1)
+        mj_njmax = _env_int("SIMPLE_MJ_NJMAX", -1)
+
+        if mj_memory > 0:
+            mjSpec.memory = mj_memory
+        if mj_nstack >= 0:
+            mjSpec.nstack = mj_nstack
+        if mj_nconmax >= 0:
+            mjSpec.nconmax = mj_nconmax
+        if mj_njmax >= 0:
+            mjSpec.njmax = mj_njmax
+
+        if mj_memory > 0 or mj_nstack >= 0 or mj_nconmax >= 0 or mj_njmax >= 0:
+            print(
+                "[MuJoCo] model size overrides: "
+                f"memory={mjSpec.memory}, nstack={mjSpec.nstack}, "
+                f"nconmax={mjSpec.nconmax}, njmax={mjSpec.njmax}"
+            )
+
         mjSpec.option.timestep = self.physics_dt
         mjSpec.option.impratio = 10
         mjSpec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST

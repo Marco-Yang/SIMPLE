@@ -51,7 +51,9 @@ LIFT_THRESHOLD = 0.10  # metres above initial target z to end episode
 def _reset_teleop_state(robot, agent) -> None:
     """Reset the teleop state without assuming the robot or agent exposes every optional attribute."""
     elastic_band = getattr(robot, "elastic_band", None)
-    if elastic_band is not None:
+    # Keep elastic band enabled by default to avoid aggressive free-fall at reset.
+    # Set SIMPLE_DISABLE_ELASTIC_BAND_ON_RESET=1 to restore the old behavior.
+    if elastic_band is not None and os.getenv("SIMPLE_DISABLE_ELASTIC_BAND_ON_RESET", "0") == "1":
         try:
             elastic_band.enable = False
         except Exception:
@@ -63,6 +65,17 @@ def _reset_teleop_state(robot, agent) -> None:
     reset_policy = getattr(agent, "reset_policy", None)
     if callable(reset_policy):
         reset_policy()
+
+    # Clear edge-trigger latch states so activation can reliably restart with
+    # left-menu + right-trigger after each reset.
+    pico_streamer = getattr(agent, "_pico_streamer", None)
+    if pico_streamer is not None:
+        reset_streamer = getattr(pico_streamer, "reset_status", None)
+        if callable(reset_streamer):
+            try:
+                reset_streamer()
+            except Exception:
+                pass
 
     wbc_policy = getattr(agent, "_wbc_policy", None)
     if wbc_policy is None:
@@ -318,6 +331,9 @@ def main(
     ) == "1"
     viewer_enabled = os.getenv("SIMPLE_VIEWER_ENABLE", "1") == "1"
     stream_enabled = os.getenv("SIMPLE_STREAM_ENABLE", "1") == "1"
+    force_record_after_reset = os.getenv("SIMPLE_FORCE_RECORD_AFTER_RESET", "0") == "1"
+    passive_reset_on_done = os.getenv("SIMPLE_PASSIVE_RESET_ON_DONE", "1") == "1"
+    done_reset_consecutive = max(1, int(os.getenv("SIMPLE_DONE_RESET_CONSECUTIVE", "3")))
     perf_log_interval = float(os.getenv("SIMPLE_PERF_LOG_INTERVAL_SECS", "5.0"))
     overrun_log_interval = float(
         os.getenv(
@@ -327,6 +343,11 @@ def main(
     )
     last_overrun_log_ts = 0.0
     last_perf_log_ts = time.monotonic()
+    # Post-reset settle can reduce visual penetration, but aggressive settling
+    # may destabilize some scenes. Keep it off by default and opt-in via env var.
+    reset_settle_steps = max(0, int(os.getenv("SIMPLE_RESET_SETTLE_STEPS", "0")))
+    pending_force_record_after_reset = False
+    done_signal_count = 0
 
     def _on_episode_reset():
         """In recording mode, reset the WBC pipeline to a consistent initial pose,
@@ -334,6 +355,46 @@ def main(
         if not record:
             return
         _reset_teleop_state(robot, agent)
+
+    def _stabilize_after_reset(observation, privileged_info):
+        """Run a short post-reset stabilization to reduce startup penetration/drop artifacts."""
+        if reset_settle_steps <= 0:
+            return observation, privileged_info
+        elastic_band = getattr(robot, "elastic_band", None)
+        if elastic_band is not None and getattr(elastic_band, "enable", False):
+            # Avoid stepping stabilization actions while the robot is still on
+            # the elastic band; this can introduce unstable impulses.
+            return observation, privileged_info
+        obs = observation
+        info = privileged_info
+        for _ in range(reset_settle_steps):
+            proprio = info.get("proprio") if isinstance(info, dict) else None
+            settle_action = agent.get_stabilize_action(proprio)
+
+            try:
+                obs, _, _, _, info = env.step(settle_action)
+            except Exception as exc:
+                print(f"[ResetSettle] Step failed ({exc}), falling back to clean reset state")
+                obs2, info2 = env.reset()
+                _on_episode_reset()
+                return obs2, info2
+
+            # Guard against transient simulation explosions after reset.
+            qpos = np.asarray(obs.get("joint_qpos", []), dtype=np.float64)
+            if qpos.size > 0 and not np.isfinite(qpos).all():
+                print("[ResetSettle] Non-finite joint_qpos detected, falling back to clean reset state")
+                obs2, info2 = env.reset()
+                _on_episode_reset()
+                return obs2, info2
+        return obs, info
+
+    def _reset_env(reason: str):
+        print(f"[Reset] reason={reason}")
+        obs, info = env.reset()
+        _on_episode_reset()
+        obs, info = _stabilize_after_reset(obs, info)
+        objs = list(sonic_env.mujoco.mj_objects.keys())
+        return obs, info, objs
 
     # stabilized_printed = False
     step_pbar = None  # Progress bar for current recording episode
@@ -346,11 +407,7 @@ def main(
     # env.unwrapped._telemetry = telemetry
     # env.unwrapped.mujoco._telemetry = telemetry
 
-    observation, privileged_info = env.reset()
-    _on_episode_reset()
-
-    # Read obj_names after first reset so layout is populated by domain randomization.
-    obj_names = list(sonic_env.mujoco.mj_objects.keys())
+    observation, privileged_info, obj_names = _reset_env("startup")
 
     if record:
         # timestamp = datetime.now().strftime("%m%d%H%M%S")
@@ -375,7 +432,8 @@ def main(
         f"low_latency_mode={low_latency_mode}, viewer_every_n={viewer_every_n}, "
         f"stream_every_n={stream_every_n}, record_every_n={record_every_n}, "
         f"update_reward={update_reward_enabled}, viewer_enabled={viewer_enabled}, "
-        f"stream_enabled={stream_enabled}, "
+        f"stream_enabled={stream_enabled}, force_record_after_reset={force_record_after_reset}, "
+        f"passive_reset_on_done={passive_reset_on_done}, done_reset_consecutive={done_reset_consecutive}, "
         f"perf_log_interval={perf_log_interval}s"
     )
 
@@ -397,6 +455,11 @@ def main(
                 # for _ in range(int(control_dt / robot.sim_dt)):
                 observation, reward, terminated, truncated, privileged_info = env.step(action)
 
+            if terminated or truncated:
+                done_signal_count += 1
+            else:
+                done_signal_count = 0
+
             # if "proprio" in info:
             #     agent.publish_low_state(info["proprio"])
 
@@ -410,14 +473,12 @@ def main(
                         step_pbar.close()
                         step_pbar = None
 
-                observation, privileged_info = env.reset()
-                # synced_proprio = info.copy()  # capture sim state after reset for recording
-                _on_episode_reset()
-                obj_names = list(sonic_env.mujoco.mj_objects.keys())
+                observation, privileged_info, obj_names = _reset_env("button_combo")
                 sim_cnt = 0
                 # stabilized_printed = False
                 rec_state = RecordingState.WAITING_FOR_LANDING
                 initial_target_z = None
+                pending_force_record_after_reset = True
                 print("[TeleopDecoupled] Environment reset complete")
 
             with telemetry.timer("update_viewer"):
@@ -457,10 +518,20 @@ def main(
                         )
                         teleop_policy = getattr(agent, "_teleop_policy", None)
                         teleop_active = bool(getattr(teleop_policy, "is_active", False))
-                        if elastic_done and teleop_active and getattr(robot, "stabilized", False) and getattr(agent, "_cached_target_q", None) is not None:
+                        teleop_ready = teleop_active and getattr(agent, "_cached_target_q", None) is not None
+                        normal_ready = elastic_done and teleop_ready and getattr(robot, "stabilized", False)
+                        forced_ready = (
+                            force_record_after_reset
+                            and pending_force_record_after_reset
+                            and teleop_ready
+                        )
+                        if normal_ready or forced_ready:
                             rec_state = RecordingState.RECORDING
                             initial_target_z = None
                             sim_cnt = 0  # Reset sim counter for new episode
+                            if forced_ready:
+                                print("[Record] Force-start recording after reset via teleop activation")
+                            pending_force_record_after_reset = False
                             # Create progress bar for this recording episode
                             step_pbar = tqdm(desc=f"Recording episode {episodes_saved + 1}", unit="frame",
                                             leave=False, position=1, bar_format="{desc} {n_fmt} {rate_fmt}")
@@ -484,8 +555,21 @@ def main(
                         #     if current_z - initial_target_z >= LIFT_THRESHOLD:
                         #         rec_state = RecordingState.EPISODE_DONE
 
-                        if terminated or truncated :
-                            rec_state = RecordingState.EPISODE_DONE
+                        if terminated or truncated:
+                            if done_signal_count >= done_reset_consecutive:
+                                if passive_reset_on_done:
+                                    print(
+                                        "[PassiveReset] episode done signal accepted: "
+                                        f"terminated={terminated}, truncated={truncated}, "
+                                        f"count={done_signal_count}"
+                                    )
+                                    rec_state = RecordingState.EPISODE_DONE
+                                else:
+                                    print(
+                                        "[PassiveReset] episode done signal ignored "
+                                        f"(terminated={terminated}, truncated={truncated}, "
+                                        f"count={done_signal_count}, disabled by SIMPLE_PASSIVE_RESET_ON_DONE=0)"
+                                    )
 
                     if rec_state == RecordingState.EPISODE_DONE:
                         # Close progress bar for this episode
@@ -506,13 +590,12 @@ def main(
                             print(f"[Record] Reached {num_episodes} episodes, stopping")
                             break
                         # Auto-reset for next episode
-                        observation, privileged_info = env.reset()
-                        _on_episode_reset()
-                        obj_names = list(sonic_env.mujoco.mj_objects.keys())
+                        observation, privileged_info, obj_names = _reset_env("episode_done")
                         sim_cnt = 0
                         # stabilized_printed = False
                         rec_state = RecordingState.WAITING_FOR_LANDING
                         initial_target_z = None
+                        pending_force_record_after_reset = bool(force_record_after_reset)
                         continue  # skip sleep / increment for this iteration
 
             elapsed = time.monotonic() - step_start
