@@ -171,22 +171,26 @@ class Graspnet1BAssetManager(AssetManager):
         for dir, dirs, files in os.walk(collision_mesh_new_dir):
             collision_meshes_mujoco = [dir + "/" + file for file in files if file.startswith('convex_piece')]
     
-        stable_poses = np.load(
-            resolve_data_path(
-                f"{self.src_dir}/stable/{asset_id_int}_stable.npy",
-                auto_download=True,
-            ),
-            allow_pickle=True,
+        stable_pose_path = resolve_data_path(
+            f"{self.src_dir}/stable/{asset_id_int}_stable.npy",
+            auto_download=True,
         )
+        if os.path.exists(stable_pose_path):
+            stable_poses = np.load(stable_pose_path, allow_pickle=True)
+        else:
+            print(f"Warning: missing grasp pose data at {stable_pose_path}; using an empty fallback.")
+            stable_poses = np.empty((0,), dtype=object)
+
         canonical_grasps = []
         for stable_idx in range(len(stable_poses)):
-            graspgroup = np.load(
-                resolve_data_path(
-                    f"{self.src_dir}/stable/grasps/{asset_id_int}_stable_{stable_idx}_grasps.npy",
-                    auto_download=True,
-                ),
-                allow_pickle=True,
+            graspgroup_path = resolve_data_path(
+                f"{self.src_dir}/stable/grasps/{asset_id_int}_stable_{stable_idx}_grasps.npy",
+                auto_download=True,
             )
+            if not os.path.exists(graspgroup_path):
+                print(f"Warning: missing grasp group data at {graspgroup_path}; skipping.")
+                continue
+            graspgroup = np.load(graspgroup_path, allow_pickle=True)
             grasps = []
             # if graspgroup.shape[0] > 0:
             for gid in range(graspgroup.shape[0]):

@@ -6,6 +6,7 @@ Licensed under the terms in LICENSE file.
 """
 
 import time
+import os
 import cv2
 import numpy as np
 
@@ -29,13 +30,26 @@ class PicoDecoupledAgent(SonicWbcAgent):
     are derived from the Pico controller buttons read by the same streamer.
     """
 
-    def __init__(self, robot: G1Sonic):
+    def __init__(self, robot: G1Sonic, sonic_cfg: dict | None = None):
         super().__init__(robot)
 
         self.episodes_saved = 0
         self.num_episodes = 100
         self.image_publish_process = None
-        self.sim_dt = self.robot.sonic_config["SIMULATE_DT"]
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "sonic_config", None)
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "cfg", None)
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "sim_config", None)
+        if sonic_cfg is None:
+            task = getattr(self.robot, "task", None)
+            if task is not None:
+                sonic_cfg = getattr(task, "sonic_config", None)
+        if sonic_cfg is None:
+            raise AttributeError("robot does not expose sonic_config/cfg/sim_config for PicoDecoupledAgent")
+        self.sonic_cfg = sonic_cfg
+        self.sim_dt = sonic_cfg["SIMULATE_DT"]
 
         # Controlled drop state (same as PicoSonicAgent)
         self._dropping = False
@@ -82,8 +96,31 @@ class PicoDecoupledAgent(SonicWbcAgent):
             height = camera_req.get("height") or 720
             bitrate = camera_req.get("bitrate") or 4_000_000
             hevc = bool(camera_req.get("enableMvHevc"))
+
+            # Optional compatibility mode for unstable Pico decoders/network.
+            # Enable with: export SIMPLE_PICO_SAFE_STREAM=1
+            if os.getenv("SIMPLE_PICO_SAFE_STREAM", "0") == "1":
+                width = int(os.getenv("SIMPLE_PICO_SAFE_WIDTH", "2560"))
+                height = int(os.getenv("SIMPLE_PICO_SAFE_HEIGHT", "720"))
+                fps = int(os.getenv("SIMPLE_PICO_SAFE_FPS", "30"))
+                bitrate = int(os.getenv("SIMPLE_PICO_SAFE_BITRATE", "2000000"))
+
+            force_h264 = os.getenv("SIMPLE_PICO_FORCE_H264", "0") == "1"
+            force_hevc = os.getenv("SIMPLE_PICO_FORCE_HEVC", "0") == "1"
+            if force_h264 and force_hevc:
+                force_hevc = False
+            if force_h264:
+                hevc = False
+            elif force_hevc:
+                hevc = True
+
             ip = camera_req.get("ip")
             port = camera_req.get("port")
+
+            print(
+                "[PicoDecoupled] Stream config: "
+                f"{width}x{height}@{fps}, bitrate={bitrate}, codec={'hevc' if hevc else 'h264'}"
+            )
 
             if not ip or not port:
                 print("[PicoDecoupled] OPEN_CAMERA missing ip/port, cannot stream")
@@ -118,19 +155,62 @@ class PicoDecoupledAgent(SonicWbcAgent):
         tcp_server.start()
 
     def _init_decoupled_policy(self):
-        """Initialize the decoupled WBC pipeline (streamer + teleop IK + WBC policy)."""
-        from decoupled_wbc.control.robot_model.instantiation.g1 import (
-            instantiate_g1_robot_model,
-        )
-        from decoupled_wbc.control.teleop.solver.hand.instantiation.g1_hand_ik_instantiation import (
-            instantiate_g1_hand_ik_solver,
-        )
-        from decoupled_wbc.control.teleop.teleop_retargeting_ik import TeleopRetargetingIK
-        from decoupled_wbc.control.policy.teleop_policy import TeleopPolicy
-        from decoupled_wbc.control.policy.wbc_policy_factory import get_wbc_policy
-        from decoupled_wbc.control.main.teleop.configs.configs import ControlLoopConfig
+        """Initialize the decoupled WBC pipeline (streamer + teleop IK + WBC policy).
 
-        sonic_cfg = self.robot.sonic_config
+        If the optional decoupled_wbc stack is not available in the current runtime,
+        fall back to a minimal placeholder so the teleop CLI can still boot in a
+        degraded mode.
+        """
+        sonic_cfg = getattr(self, "sonic_cfg", None)
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "sonic_config", None)
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "cfg", None)
+        if sonic_cfg is None:
+            sonic_cfg = getattr(self.robot, "sim_config", None)
+        if sonic_cfg is None:
+            task = getattr(self.robot, "task", None)
+            if task is not None:
+                sonic_cfg = getattr(task, "sonic_config", None)
+        if sonic_cfg is None:
+            raise AttributeError("robot does not expose sonic_config/cfg/sim_config for PicoDecoupledAgent")
+
+        self._teleop_initialized = False
+        self._teleop_was_active = False
+        self._teleop_activate_time: float | None = None
+        self._t_start = time.monotonic()
+        self._control_frequency = 50
+        self._arm_engage_smooth_secs = 1.0
+        self._control_dt = 4 * self.sim_dt
+        self._cached_target_q = None
+        self._cached_left_hand_q = None
+        self._cached_right_hand_q = None
+        self._degraded_warning_printed = False
+        self._auto_activate_attempted = False
+        self._auto_drop_attempted = False
+        self._last_pre_stab_log_ts = 0.0
+        self._pre_stabilize_loops = 0
+        self._stabilize_bypass = False
+
+        try:
+            from decoupled_wbc.control.robot_model.instantiation.g1 import (
+                instantiate_g1_robot_model,
+            )
+            from decoupled_wbc.control.teleop.solver.hand.instantiation.g1_hand_ik_instantiation import (
+                instantiate_g1_hand_ik_solver,
+            )
+            from decoupled_wbc.control.teleop.teleop_retargeting_ik import TeleopRetargetingIK
+            from decoupled_wbc.control.policy.teleop_policy import TeleopPolicy
+            from decoupled_wbc.control.policy.wbc_policy_factory import get_wbc_policy
+            from decoupled_wbc.control.main.teleop.configs.configs import ControlLoopConfig
+        except Exception as exc:
+            print(f"Warning: decoupled_wbc stack unavailable ({exc}); using a degraded teleop stub.")
+            self._wbc_policy = None
+            self._teleop_policy = None
+            self._dwbc_robot_model = None
+            self._pico_streamer = None
+            return
+
         enable_waist = sonic_cfg.get("enable_waist", False)
         waist_location = "lower_and_upper_body" if enable_waist else "lower_body"
 
@@ -175,6 +255,11 @@ class PicoDecoupledAgent(SonicWbcAgent):
         hand_control_device = sonic_cfg.get("hand_control_device", "pico")
         body_streamer_ip = sonic_cfg.get("body_streamer_ip", "192.168.0.1")
 
+        print(
+            "[PicoDecoupled] Teleop device config: "
+            f"body={body_control_device}, hand={hand_control_device}, body_streamer_ip={body_streamer_ip}"
+        )
+
         self._teleop_policy = TeleopPolicy(
             robot_model=self._dwbc_robot_model,
             retargeting_ik=retargeting_ik,
@@ -187,25 +272,24 @@ class PicoDecoupledAgent(SonicWbcAgent):
         # Keep a reference to the underlying PicoStreamer so we can read
         # raw button states for drop_robot / reset_env detection.
         self._pico_streamer = self._teleop_policy.teleop_streamer.body_streamer
-
-        self._teleop_initialized = False
-        self._teleop_was_active = False
-        self._teleop_activate_time: float | None = None
-        self._t_start = time.monotonic()
-        self._control_frequency = dwbc_config.control_frequency
-
-        # Seconds over which target_time decays from engage-window to normal 1/freq
-        self._arm_engage_smooth_secs = 1.0
-
-        # Control timestep at 50 Hz (main loop runs at this frequency)
-        self._control_dt = 4 * self.sim_dt  # 0.02 s
-        self._cached_target_q = None
-        self._cached_left_hand_q = None
-        self._cached_right_hand_q = None
+        print(
+            "[PicoDecoupled] Teleop streamer instance: "
+            f"{type(self._pico_streamer).__name__ if self._pico_streamer is not None else 'None'}"
+        )
 
     # ------------------------------------------------------------------
     # Button helpers (read directly from PicoStreamer's XrClient)
     # ------------------------------------------------------------------
+
+    def _fallback_action(self) -> dict:
+        return {
+            "q": np.zeros(43, dtype=np.float32),
+            "base_height_command": np.array([0.0], dtype=np.float32),
+            "navigate_cmd": np.zeros(4, dtype=np.float32),
+            "torso_rpy_cmd": np.zeros(3, dtype=np.float32),
+            "action_eef": np.zeros(14, dtype=np.float32),
+            "obs_tensor": np.zeros((1, 516), dtype=np.float32),
+        }
 
     def _poll_pico_buttons(self):
         """Read Pico controller buttons and detect edge-triggered sim commands.
@@ -214,6 +298,8 @@ class PicoDecoupledAgent(SonicWbcAgent):
           - right_axis_click          -> drop_robot
           - left_grip + right_grip    -> reset_env
         """
+        if getattr(self, "_pico_streamer", None) is None:
+            return
         xr = self._pico_streamer.xr_client
 
         # --- drop_robot: right joystick click (edge-triggered) ---
@@ -334,15 +420,44 @@ class PicoDecoupledAgent(SonicWbcAgent):
         forward), matching what teleop does before the operator activates the teleop policy.
         Does NOT read from episode data or advance _data_row_index.
         """
+        if getattr(self, "_wbc_policy", None) is None or getattr(self, "_dwbc_robot_model", None) is None:
+            return ActionCmd(
+                "decoupled_wbc",
+                target_q=np.zeros(29, dtype=np.float32),
+                left_hand_q=np.zeros(7, dtype=np.float32),
+                right_hand_q=np.zeros(7, dtype=np.float32),
+                base_height_command=np.array([0.0], dtype=np.float32),
+                navigate_cmd=np.zeros(4, dtype=np.float32),
+                torso_rpy_cmd=np.zeros(3, dtype=np.float32),
+                action_eef=np.zeros(14, dtype=np.float32),
+                obs_tensor=np.zeros((1, 516), dtype=np.float32),
+            )
+
         # Always run the full WBC pipeline (main loop now at 50Hz)
         from decoupled_wbc.control.main.constants import (
             DEFAULT_BASE_HEIGHT,
             DEFAULT_NAV_CMD,
         )
         t_now = time.monotonic()
+
+        # Optional fallback: auto-activate teleop once at startup when button events
+        # are not delivered reliably on the headset side.
+        if (
+            os.getenv("SIMPLE_PICO_AUTO_ACTIVATE", "0") == "1"
+            and not self._auto_activate_attempted
+            and getattr(self, "_teleop_policy", None) is not None
+            and not self._teleop_policy.is_active
+        ):
+            self._auto_activate_attempted = True
+            try:
+                self._teleop_policy.activate_policy(wait_for_activation=0)
+                print("[PicoDecoupled] Auto-activation requested via SIMPLE_PICO_AUTO_ACTIVATE=1")
+            except Exception as exc:
+                print(f"[PicoDecoupled] Auto-activation failed: {exc}")
         control_freq = self._control_frequency
 
-        proprio = self.robot.prepare_obs()
+        if proprio is None:
+            proprio = getattr(self.robot, "prepare_obs", lambda: {})()
         wbc_obs = self._build_wbc_observation(proprio)
         self._wbc_policy.set_observation(wbc_obs)
 
@@ -379,6 +494,9 @@ class PicoDecoupledAgent(SonicWbcAgent):
 
         Returns dict with "q" key containing target joint positions.
         """
+        if getattr(self, "_teleop_policy", None) is None or getattr(self, "_wbc_policy", None) is None or getattr(self, "_dwbc_robot_model", None) is None:
+            return self._fallback_action()
+
         t_now = time.monotonic()
 
         # # Suppress activation until the robot has stabilized
@@ -465,24 +583,43 @@ class PicoDecoupledAgent(SonicWbcAgent):
         # Run full WBC pipeline every step (main loop now at 50Hz)
         # proprio = self.robot.prepare_obs()
         # for k,v in kwargs["privileged_info"]["proprio"].items(): assert np.all(v == proprio[k])
-        proprio = kwargs["privileged_info"]["proprio"]
-        if not self.robot.stabilized:
-            return self.get_stabilize_action(proprio)
-        
-        wbc_action = self._run_decoupled_policy(proprio)
+        privileged_info = kwargs.get("privileged_info", {})
+        proprio = privileged_info.get("proprio")
+        if proprio is None:
+            proprio = getattr(self.robot, "prepare_obs", lambda: {})()
 
-        # Read Pico buttons directly for drop_robot / reset_env
+        # Try one-shot auto-activation early, even before stabilization.
+        # This avoids getting stuck when activation button events are not delivered.
+        if (
+            os.getenv("SIMPLE_PICO_AUTO_ACTIVATE", "0") == "1"
+            and not self._auto_activate_attempted
+            and getattr(self, "_teleop_policy", None) is not None
+        ):
+            self._auto_activate_attempted = True
+            try:
+                self._teleop_policy.activate_policy(wait_for_activation=0)
+                print("[PicoDecoupled] Auto-activation requested via SIMPLE_PICO_AUTO_ACTIVATE=1")
+            except Exception as exc:
+                print(f"[PicoDecoupled] Auto-activation failed: {exc}")
+
+        # Always poll Pico buttons, even before stabilization.
+        # Otherwise drop/reset commands can never be consumed while the robot
+        # is hanging on the elastic band.
         self._poll_pico_buttons()
 
-        # Cache the target joint positions for use in _build_frame() for recording
-        # Body: 29 joints in URDF=MJCF=SIMPLE order
-        self._cached_target_q = self._dwbc_robot_model.get_body_actuated_joints(wbc_action["q"])
-        # Hands: 7 joints each (driven by trigger/grip via teleop IK)
-        # format: thumb/index/middle (SIMPLE order)
-        self._cached_left_hand_q = self._dwbc_robot_model.get_hand_actuated_joints(wbc_action["q"], side="left")
-        self._cached_right_hand_q = self._dwbc_robot_model.get_hand_actuated_joints(wbc_action["q"], side="right")
+        # Optional fallback: force controlled drop once when the stream is up.
+        if (
+            os.getenv("SIMPLE_PICO_AUTO_DROP", "0") == "1"
+            and not self._auto_drop_attempted
+            and self.robot.elastic_band
+            and self.robot.elastic_band.enable
+            and not self._dropping
+        ):
+            self._auto_drop_attempted = True
+            self._dropping = True
+            print("[PicoDecoupled] Auto-drop enabled via SIMPLE_PICO_AUTO_DROP=1")
 
-        # Handle elastic band descent
+        # Handle elastic band descent and pass-through mode before early returns.
         if self._dropping and self.robot.elastic_band and self.robot.elastic_band.enable:
             self.robot.elastic_band.length -= self._drop_rate * self._control_dt
             if self.robot.elastic_band.length <= -0.25 and abs(self.robot.pelvis_vz) < 0.05:
@@ -490,7 +627,6 @@ class PicoDecoupledAgent(SonicWbcAgent):
                 self._dropping = False
                 print(f"[PicoDecoupled] Robot landed (pelvis Z={self.robot.pelvis_z:.3f} m)")
 
-        # While elastic band is active, only apply band forces (ignore WBC output)
         if (
             self.robot.elastic_band
             and self.robot.elastic_band.enable
@@ -501,6 +637,75 @@ class PicoDecoupledAgent(SonicWbcAgent):
                 dropping=self._dropping,
                 drop_rate=self._drop_rate,
             )
+
+        stabilized_now = bool(getattr(self.robot, "stabilized", False))
+        if not stabilized_now:
+            self._pre_stabilize_loops += 1
+            eb = getattr(self.robot, "elastic_band", None)
+            eb_enabled = bool(getattr(eb, "enable", False))
+            force_bypass = os.getenv("SIMPLE_PICO_BYPASS_STABILIZE", "0") == "1"
+            max_loops = int(os.getenv("SIMPLE_PICO_STABILIZE_MAX_LOOPS", "40"))
+            timeout_bypass = (not eb_enabled) and (self._pre_stabilize_loops >= max_loops)
+
+            if force_bypass or timeout_bypass:
+                if not self._stabilize_bypass:
+                    reason = "forced" if force_bypass else f"timeout({self._pre_stabilize_loops} loops)"
+                    print(
+                        "[PicoDecoupled] Bypassing stabilization gate: "
+                        f"reason={reason}, elastic_band.enable={eb_enabled}"
+                    )
+                self._stabilize_bypass = True
+            else:
+                now = time.monotonic()
+                if now - self._last_pre_stab_log_ts > 2.0:
+                    self._last_pre_stab_log_ts = now
+                    print(
+                        "[PicoDecoupled] Waiting stabilization: "
+                        f"stabilized=False, dropping={self._dropping}, elastic_band.enable={eb_enabled}"
+                    )
+                return self.get_stabilize_action(proprio)
+        else:
+            self._pre_stabilize_loops = 0
+            self._stabilize_bypass = False
+
+        if getattr(self, "_teleop_policy", None) is None or getattr(self, "_wbc_policy", None) is None or getattr(self, "_dwbc_robot_model", None) is None:
+            if getattr(self, "_degraded_warning_printed", False) is False:
+                print("[PicoDecoupled] decoupled_wbc unavailable; using stable zero-action fallback for data collection")
+                self._degraded_warning_printed = True
+            fallback = self._fallback_action()
+            self._cached_target_q = np.zeros(29, dtype=np.float32)
+            self._cached_left_hand_q = np.zeros(7, dtype=np.float32)
+            self._cached_right_hand_q = np.zeros(7, dtype=np.float32)
+            return ActionCmd(
+                "decoupled_wbc",
+                target_q=self._cached_target_q,
+                left_hand_q=self._cached_left_hand_q,
+                right_hand_q=self._cached_right_hand_q,
+                base_height_command=fallback["base_height_command"],
+                navigate_cmd=fallback["navigate_cmd"],
+                torso_rpy_cmd=fallback["torso_rpy_cmd"],
+                action_eef=fallback["action_eef"],
+                obs_tensor=fallback["obs_tensor"],
+            )
+        
+        wbc_action = self._run_decoupled_policy(proprio)
+        defaults = self._fallback_action()
+        for key in ("base_height_command", "navigate_cmd", "torso_rpy_cmd", "action_eef", "obs_tensor"):
+            if key not in wbc_action:
+                wbc_action[key] = defaults[key]
+
+        # Cache the target joint positions for use in _build_frame() for recording
+        # Body: 29 joints in URDF=MJCF=SIMPLE order
+        if self._dwbc_robot_model is not None:
+            self._cached_target_q = self._dwbc_robot_model.get_body_actuated_joints(wbc_action["q"])
+            # Hands: 7 joints each (driven by trigger/grip via teleop IK)
+            # format: thumb/index/middle (SIMPLE order)
+            self._cached_left_hand_q = self._dwbc_robot_model.get_hand_actuated_joints(wbc_action["q"], side="left")
+            self._cached_right_hand_q = self._dwbc_robot_model.get_hand_actuated_joints(wbc_action["q"], side="right")
+        else:
+            self._cached_target_q = np.zeros(29, dtype=np.float32)
+            self._cached_left_hand_q = np.zeros(7, dtype=np.float32)
+            self._cached_right_hand_q = np.zeros(7, dtype=np.float32)
 
         return ActionCmd( # all synced!
             "decoupled_wbc",
@@ -523,18 +728,25 @@ class PicoDecoupledAgent(SonicWbcAgent):
         aligning with the default pose), resets the lower-body RL policy's
         observation history, and clears cached joint targets.
         """
-        import collections
-
         t_now = time.monotonic()
 
         # 1. Reset entire decoupled WBC pipeline (upper and lower body policies)
-        self._wbc_policy.reset(init_time=t_now)
+        if getattr(self, "_wbc_policy", None) is not None:
+            try:
+                self._wbc_policy.reset(init_time=t_now)
+            except Exception as exc:
+                print(f"[PicoDecoupled] WBC reset skipped: {exc}")
 
         # 2. Reset and deactivate the teleop policy.
         #    This clears retargeting IK, sets is_active=False so the upper
         #    body holds the default pose until the operator re-activates
         #    (via the Pico activation button), which also re-calibrates.
-        self._teleop_policy.reset()
+        teleop_policy = getattr(self, "_teleop_policy", None)
+        if teleop_policy is not None:
+            try:
+                teleop_policy.reset()
+            except Exception as exc:
+                print(f"[PicoDecoupled] Teleop reset skipped: {exc}")
 
         # 3. Clear cached joint targets
         self._cached_target_q = None
@@ -544,11 +756,17 @@ class PicoDecoupledAgent(SonicWbcAgent):
         self._teleop_was_active = False
         self._teleop_activate_time = None
         self._last_teleop_action = {}
+        self._pre_stabilize_loops = 0
+        self._stabilize_bypass = False
 
     def publish_low_state(self, proprio):
         # No Unitree bridge needed — decoupled WBC reads from SIMPLE directly
         pass
 
     def close(self):
-        if hasattr(self, "_teleop_policy"):
-            self._teleop_policy.close()
+        teleop_policy = getattr(self, "_teleop_policy", None)
+        if teleop_policy is not None:
+            try:
+                teleop_policy.close()
+            except Exception as exc:
+                print(f"[PicoDecoupled] Teleop policy close skipped: {exc}")

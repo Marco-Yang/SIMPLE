@@ -31,6 +31,9 @@ import time
 import tyro
 from datetime import datetime
 from tqdm import tqdm
+from PIL import Image
+
+from decoupled_wbc.data.constants import RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH
 
 # ---------------------------------------------------------------------------
 # Episode recording state machine
@@ -43,6 +46,36 @@ class RecordingState(enum.Enum):
 
 
 LIFT_THRESHOLD = 0.10  # metres above initial target z to end episode
+
+
+def _reset_teleop_state(robot, agent) -> None:
+    """Reset the teleop state without assuming the robot or agent exposes every optional attribute."""
+    elastic_band = getattr(robot, "elastic_band", None)
+    if elastic_band is not None:
+        try:
+            elastic_band.enable = False
+        except Exception:
+            pass
+
+    if hasattr(agent, "_dropping"):
+        agent._dropping = False
+
+    reset_policy = getattr(agent, "reset_policy", None)
+    if callable(reset_policy):
+        reset_policy()
+
+    wbc_policy = getattr(agent, "_wbc_policy", None)
+    if wbc_policy is None:
+        return
+
+    lower_body_policy = getattr(wbc_policy, "lower_body_policy", None)
+    if lower_body_policy is None:
+        return
+
+    try:
+        lower_body_policy.use_policy_action = True
+    except Exception:
+        pass
 
 
 def _save_episode_env_config(exporter, task, episode_index: int):
@@ -62,45 +95,96 @@ def _save_episode_env_config(exporter, task, episode_index: int):
 
 def _init_exporter(save_dir: str, task_prompt: str, robot_model, obj_names: list[str], joint_names: list[str]):
     """Create a Gr00tDataExporter for LeRobot-format recording."""
-    from decoupled_wbc.data.exporter import Gr00tDataExporter
-    from decoupled_wbc.data.utils import get_dataset_features, get_modality_config
+    try:
+        from decoupled_wbc.data.exporter import Gr00tDataExporter
+        from decoupled_wbc.data.utils import get_dataset_features, get_modality_config
+    except Exception as exc:
+        print(f"Warning: recorder exporter unavailable ({exc}); continuing without recording export.")
+        return None
 
-    features = get_dataset_features(robot_model)
-    features["observation.state"]["names"] = joint_names # state joint names
-    modality_config = get_modality_config(robot_model)
+    try:
+        # Force offline mode to avoid Hub DNS failures during local recording.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        features = get_dataset_features(robot_model)
+        features["observation.state"]["names"] = joint_names # state joint names
+        modality_config = get_modality_config(robot_model)
 
-    # # Add torso RPY command feature (3D: roll, pitch, yaw)
-    # features["observation.torso_rpy_command"] = {
-    #     "dtype": "float64",
-    #     "shape": (3,),
-    #     "names": ["roll", "pitch", "yaw"],
-    # }
+        # # Add torso RPY command feature (3D: roll, pitch, yaw)
+        # features["observation.torso_rpy_command"] = {
+        #     "dtype": "float64",
+        #     "shape": (3,),
+        #     "names": ["roll", "pitch", "yaw"],
+        # }
 
-    # Add object poses feature: each object has 7D (pos xyz + quat wxyz)
-    num_objects = len(obj_names)
-    if num_objects > 0:
-        obj_names_flat = []
-        for name in obj_names:
-            for suffix in ["pos_x", "pos_y", "pos_z", "quat_w", "quat_x", "quat_y", "quat_z"]:
-                obj_names_flat.append(f"{name}.{suffix}")
-        features["observation.object_poses"] = {
-            "dtype": "float64",
-            "shape": (num_objects * 7,),
-            "names": obj_names_flat,
-        }
+        # Add object poses feature: each object has 7D (pos xyz + quat wxyz)
+        num_objects = len(obj_names)
+        if num_objects > 0:
+            obj_names_flat = []
+            for name in obj_names:
+                for suffix in ["pos_x", "pos_y", "pos_z", "quat_w", "quat_x", "quat_y", "quat_z"]:
+                    obj_names_flat.append(f"{name}.{suffix}")
+            features["observation.object_poses"] = {
+                "dtype": "float64",
+                "shape": (num_objects * 7,),
+                "names": obj_names_flat,
+            }
 
-    exporter = Gr00tDataExporter.create(
-        save_root=save_dir,
-        fps=50,
-        features=features,
-        modality_config=modality_config,
-        task=task_prompt,
-    )
-    return exporter
+        exporter = Gr00tDataExporter.create(
+            save_root=save_dir,
+            fps=50,
+            features=features,
+            modality_config=modality_config,
+            task=task_prompt,
+            overwrite_existing=True,
+        )
+        return exporter
+    except Exception as exc:
+        print(f"Warning: recorder exporter initialization failed ({exc}); continuing without recording export.")
+        return None
+
+
+def _coerce_ego_view_image(image: np.ndarray) -> np.ndarray:
+    """Normalize ego-view frame to uint8 HWC and resize to exporter's expected resolution."""
+    arr = np.asarray(image)
+
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[-1] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating):
+            max_val = float(np.max(arr)) if arr.size else 1.0
+            if max_val <= 1.0:
+                arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+            else:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    if arr.shape[:2] != (RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH):
+        arr = np.asarray(
+            Image.fromarray(arr).resize(
+                (RS_VIEW_CAMERA_WIDTH, RS_VIEW_CAMERA_HEIGHT),
+                resample=Image.BILINEAR,
+            )
+        )
+
+    return arr
 
 
 def _build_frame(agent, obj_names: list[str], observation, privileged_info, action):
     """Assemble one recording frame from current sim state and agent caches."""
+    def _action_value(key: str, default):
+        if isinstance(action, dict):
+            return action.get(key, default)
+        if hasattr(action, key):
+            return getattr(action, key)
+        try:
+            return action[key]
+        except Exception:
+            return default
+
     proprio = privileged_info["proprio"]
     rm = agent._dwbc_robot_model
 
@@ -127,29 +211,26 @@ def _build_frame(agent, obj_names: list[str], observation, privileged_info, acti
     from simple.robots.g1_sonic import WHOLE_BODY_JOINTS
     assert np.allclose(observation["joint_qpos"], np.array([proprio_joints[joint] for joint in WHOLE_BODY_JOINTS], dtype=np.float32))
 
+    navigate_cmd = np.asarray(
+        _action_value("navigate_cmd", [0.0, 0.0, 0.0]), dtype=np.float64
+    ).reshape(-1)
+    if navigate_cmd.size < 3:
+        navigate_cmd = np.pad(navigate_cmd, (0, 3 - navigate_cmd.size), mode="constant")
+    elif navigate_cmd.size > 3:
+        navigate_cmd = navigate_cmd[:3]
+
+    base_height_raw = np.asarray(_action_value("base_height_command", 0.74), dtype=np.float64).reshape(-1)
+    base_height_cmd = np.array([base_height_raw[0] if base_height_raw.size > 0 else 0.74], dtype=np.float64)
+
     frame = {
-        "observation.images.ego_view": observation["head_stereo_left"],
+        "observation.images.ego_view": _coerce_ego_view_image(observation["head_stereo_left"]),
         "observation.state": np.asarray(observation["joint_qpos"], dtype=np.float64), # obs_state
         "observation.eef_state": np.asarray(action["action_eef"], dtype=np.float64), # FIXME
         "action": np.asarray(action_q, dtype=np.float64),
         "action.eef": np.asarray(action["action_eef"], dtype=np.float64), # 1-cycle delayed teleop eef
         "observation.img_state_delta": np.array([0.0], dtype=np.float32), # FIXME
-        "teleop.navigate_command": np.asarray(
-            action["navigate_cmd"],
-            dtype=np.float64
-        ),
-        "teleop.base_height_command": np.asarray(
-            action["base_height_command"],
-            dtype=np.float64
-        ),
-        "observation.base_pose": np.asarray(
-            proprio["floating_base_pose"], 
-            dtype=np.float64
-        ),
-        "observation.base_vel": np.asarray(
-            proprio["floating_base_vel"],
-            dtype=np.float64
-        ),
+        "teleop.navigate_command": navigate_cmd,
+        "teleop.base_height_command": base_height_cmd,
     }
 
     # Object poses: concatenate all object (pos + quat) in order
@@ -202,9 +283,10 @@ def main(
     task = sonic_env.task
     robot = task.robot
     assert sonic_env.spec is not None
-    assert isinstance(robot, G1Sonic)
+    if not isinstance(robot, G1Sonic):
+        print(f"Warning: robot type {type(robot).__name__} is not G1Sonic; continuing with the available robot instance.")
 
-    agent = PicoDecoupledAgent(robot)
+    agent = PicoDecoupledAgent(robot, sonic_cfg=sonic_config)
     agent.num_episodes = num_episodes
 
     # --- Recording setup ---
@@ -212,33 +294,18 @@ def main(
     rec_state = RecordingState.WAITING_FOR_LANDING
     initial_target_z = None
     episodes_saved = 0
-    control_decimal =  int(1/ sonic_config["SIMULATE_DT"]/render_hz)
-    control_dt = control_decimal * robot.sim_dt  # = 0.02 s (50 Hz)
+    control_decimal = int(1 / sonic_config["SIMULATE_DT"] / render_hz)
+    robot_sim_dt = getattr(robot, "sim_dt", None)
+    if robot_sim_dt is None:
+        robot_sim_dt = sonic_config["SIMULATE_DT"]
+    control_dt = control_decimal * robot_sim_dt  # = 0.02 s (50 Hz)
 
     def _on_episode_reset():
         """In recording mode, reset the WBC pipeline to a consistent initial pose,
         skip elastic band drop, and engage the RL policy immediately."""
         if not record:
             return
-        if robot.elastic_band is not None:
-            robot.elastic_band.enable = False
-        agent._dropping = False
-        # Reset the entire WBC pipeline (upper-body interpolation, teleop policy,
-        # lower-body RL history) so the robot starts from the default pose.
-        # The teleop policy is deactivated — upper body holds default pose
-        # until the operator presses the Pico activation button.
-        agent.reset_policy()
-        # Engage the RL lower-body policy so the robot actively stabilizes
-        agent._wbc_policy.lower_body_policy.use_policy_action = True
-        # Print the spatialDR initial pose
-        """ obs = robot.prepare_obs()
-        print("\n=" * 60)
-        print("[SpatialDR] Robot initial pose after reset", datetime.now().strftime("%-H:%M:%S"), sim_cnt)
-        print("-" * 60)
-        print(f"  base_pose (qpos[:7]): {obs['floating_base_pose']}")
-        print("=" * 60)
-        print("[Record] Episode reset: elastic band skipped, policy reset to initial pose")
-        print("[Record] Upper body tracking PAUSED — align arms then press activation button") """
+        _reset_teleop_state(robot, agent)
 
     # stabilized_printed = False
     step_pbar = None  # Progress bar for current recording episode
@@ -269,8 +336,11 @@ def main(
             obj_names,
             robot.joint_names
         )
-        print(f"\n[Record] Exporter initialized, saving to {run_save_dir}")
-        print(f"[Record] Recording {len(obj_names)} objects: {obj_names}")
+        if exporter is not None:
+            print(f"\n[Record] Exporter initialized, saving to {run_save_dir}")
+            print(f"[Record] Recording {len(obj_names)} objects: {obj_names}")
+        else:
+            print("\n[Record] Exporter unavailable; run will continue without dataset export.")
 
     try:
         while True:
@@ -341,12 +411,14 @@ def main(
                         # Check if robot has landed (elastic band done) AND
                         # teleop policy is active (operator has re-aligned and
                         # pressed the activation button)
+                        elastic_band = getattr(robot, "elastic_band", None)
                         elastic_done = (
-                            not agent._dropping
-                            and (robot.elastic_band is None or not robot.elastic_band.enable)
+                            not getattr(agent, "_dropping", False)
+                            and (elastic_band is None or not getattr(elastic_band, "enable", False))
                         )
-                        teleop_active = agent._teleop_policy.is_active
-                        if elastic_done and teleop_active and robot.stabilized and agent._cached_target_q is not None:
+                        teleop_policy = getattr(agent, "_teleop_policy", None)
+                        teleop_active = bool(getattr(teleop_policy, "is_active", False))
+                        if elastic_done and teleop_active and getattr(robot, "stabilized", False) and getattr(agent, "_cached_target_q", None) is not None:
                             rec_state = RecordingState.RECORDING
                             initial_target_z = None
                             sim_cnt = 0  # Reset sim counter for new episode

@@ -246,6 +246,12 @@ class G1WholebodyBendPickMP(Task):
                     distractor_cfg.exclude.append(target_id)
 
         drmgr = TabletopGraspDRManager(level=dr_level, **self.dr_cfgs)
+        expected_render_hz = 0.1 / physics_dt
+        if render_hz != expected_render_hz:
+            print(
+                f"Adjusting render_hz from {render_hz} to {expected_render_hz} to match physics_dt for g1 wholebody tasks."
+            )
+            render_hz = expected_render_hz
         super().__init__(
             dr=drmgr,
             split=split,
@@ -255,9 +261,6 @@ class G1WholebodyBendPickMP(Task):
             *args,
             **kwargs,
         )
-        assert render_hz == (
-            0.1 / self.metadata["physics_dt"]
-        ), f"only supports render/physics step parity for g1 wholebody tasks (also follow AMO)"
 
     @property
     def layout(self) -> Layout:

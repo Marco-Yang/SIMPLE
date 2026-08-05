@@ -1,0 +1,126 @@
+{
+    "state": {
+        "left_leg": {
+            "start": 0,
+            "end": 6
+        },
+        "right_leg": {
+            "start": 6,
+            "end": 12
+        },
+        "waist": {
+            "start": 12,
+            "end": 15
+        },
+        "left_arm": {
+            "start": 15,
+            "end": 22
+        },
+        "left_hand": {
+            "start": 22,
+            "end": 29
+        },
+        "right_arm": {
+            "start": 29,
+            "end": 36
+        },
+        "right_hand": {
+            "start": 36,
+            "end": 43
+        },
+        "left_wrist_pos": {
+            "start": 0,
+            "end": 3,
+            "original_key": "observation.eef_state"
+        },
+        "left_wrist_abs_quat": {
+            "start": 3,
+            "end": 7,
+            "original_key": "observation.eef_state",
+            "rotation_type": "quaternion"
+        },
+        "right_wrist_pos": {
+            "start": 7,
+            "end": 10,
+            "original_key": "observation.eef_state"
+        },
+        "right_wrist_abs_quat": {
+            "start": 10,
+            "end": 14,
+            "original_key": "observation.eef_state",
+            "rotation_type": "quaternion"
+        }
+    },
+    "action": {
+        "left_leg": {
+            "start": 0,
+            "end": 6
+        },
+        "right_leg": {
+            "start": 6,
+            "end": 12
+        },
+        "waist": {
+            "start": 12,
+            "end": 15
+        },
+        "left_arm": {
+            "start": 15,
+            "end": 22
+        },
+        "left_hand": {
+            "start": 22,
+            "end": 29
+        },
+        "right_arm": {
+            "start": 29,
+            "end": 36
+        },
+        "right_hand": {
+            "start": 36,
+            "end": 43
+        },
+        "left_wrist_pos": {
+            "start": 0,
+            "end": 3,
+            "original_key": "action.eef"
+        },
+        "left_wrist_abs_quat": {
+            "start": 3,
+            "end": 7,
+            "original_key": "action.eef",
+            "rotation_type": "quaternion"
+        },
+        "right_wrist_pos": {
+            "start": 7,
+            "end": 10,
+            "original_key": "action.eef"
+        },
+        "right_wrist_abs_quat": {
+            "start": 10,
+            "end": 14,
+            "original_key": "action.eef",
+            "rotation_type": "quaternion"
+        },
+        "base_height_command": {
+            "start": 0,
+            "end": 1,
+            "original_key": "teleop.base_height_command"
+        },
+        "navigate_command": {
+            "start": 0,
+            "end": 3,
+            "original_key": "teleop.navigate_command"
+        }
+    },
+    "video": {
+        "ego_view": {
+            "original_key": "observation.images.ego_view"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

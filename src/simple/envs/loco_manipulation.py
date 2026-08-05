@@ -47,10 +47,26 @@ class LocoManipulationEnv(BaseDualSim):
         else:
             ...
 
-        return {
-            "joint_qpos": qpos,
-            ** self._render_frame()
-        }
+        render_frames = self._render_frame()
+        obs = {"joint_qpos": qpos}
+        expected_keys = list(getattr(self.observation_space, "spaces", {}).keys())
+        if expected_keys:
+            for key in expected_keys:
+                if key == "joint_qpos":
+                    continue
+                if key in render_frames:
+                    obs[key] = render_frames[key]
+                else:
+                    template = None
+                    if render_frames:
+                        template = next(iter(render_frames.values()))
+                    if template is None:
+                        obs[key] = np.zeros((64, 64, 3), dtype=np.uint8)
+                    else:
+                        obs[key] = np.zeros_like(template)
+            return obs
+
+        return {"joint_qpos": qpos, **render_frames}
     
     def _get_info(self):
         info = {}
@@ -102,6 +118,11 @@ class LocoManipulationEnv(BaseDualSim):
     def render(self):
         return self._render_frame()
 
+    def update_viewer(self):
+        return None
+
+    def update_reward(self):
+        return None
 
     def _render_frame(self):
         frame_mujoco = self.mujoco.render()

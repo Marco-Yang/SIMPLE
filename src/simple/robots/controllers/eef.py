@@ -55,12 +55,17 @@ class ParallelGripperEEFController(BinaryEEFController):
     def set_initial_qpos(self, actuators: dict, joints: dict) -> None:
         """Set the initial joint positions of the eed effector."""
         for jname, qpos in zip(self.cfg.joint_names, self.cfg.init_qpos):
-            joints[jname].qpos = qpos
-            joints[jname].qvel = 0
-            joints[jname].qacc = 0
+            joint_obj = joints.get(jname)
+            actuator_obj = actuators.get(jname)
+            if joint_obj is None or actuator_obj is None:
+                print(f"Warning: skipping initial qpos for missing hand joint/actuator {jname}.")
+                continue
+            joint_obj.qpos = qpos
+            joint_obj.qvel = 0
+            joint_obj.qacc = 0
 
-            actuators[jname].ctrl = qpos
-            # actuators[jname].ctrl = 0.0205
+            actuator_obj.ctrl = qpos
+            # actuator_obj.ctrl = 0.0205
 
     def open_gripper(self, actuators: dict) -> None:
         for jname in self.cfg.joint_names:
@@ -96,10 +101,15 @@ class DexHandEEFController(Controller):
 
     def set_initial_qpos(self, actuators: dict, joints: dict) -> None:
         for jname, qpos in zip(self.cfg.joint_names, self.cfg.init_qpos):
-            joints[jname].qpos = qpos
-            joints[jname].qvel = 0
-            joints[jname].qacc = 0
-            actuators[jname].ctrl = qpos
+            joint_obj = joints.get(jname)
+            actuator_obj = actuators.get(jname)
+            if joint_obj is None or actuator_obj is None:
+                print(f"Warning: skipping initial qpos for missing hand joint/actuator {jname}.")
+                continue
+            joint_obj.qpos = qpos
+            joint_obj.qvel = 0
+            joint_obj.qacc = 0
+            actuator_obj.ctrl = qpos
 
     def open_gripper(self, actuators: dict) -> None:
         # step_distance = 0.15

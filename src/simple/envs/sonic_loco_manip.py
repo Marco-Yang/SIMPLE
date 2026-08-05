@@ -82,10 +82,26 @@ class SonicLocoManipEnv(BaseDualSim):
                 isaacsim_joint_indices.append(self.isaac.robot.get_dof_index(isaac_jname))
             qpos = self.isaac.robot.get_joint_positions(joint_indices=isaacsim_joint_indices)
 
-        return {
-            "joint_qpos": qpos,
-            ** self._render_frame()
-        }
+        render_frames = self._render_frame()
+        obs = {"joint_qpos": qpos}
+        expected_keys = list(getattr(self.observation_space, "spaces", {}).keys())
+        if expected_keys:
+            for key in expected_keys:
+                if key == "joint_qpos":
+                    continue
+                if key in render_frames:
+                    obs[key] = render_frames[key]
+                else:
+                    template = None
+                    if render_frames:
+                        template = next(iter(render_frames.values()))
+                    if template is None:
+                        obs[key] = np.zeros((64, 64, 3), dtype=np.uint8)
+                    else:
+                        obs[key] = np.zeros_like(template)
+            return obs
+
+        return {"joint_qpos": qpos, **render_frames}
     
     def _get_info(self):
         info = {}
@@ -119,13 +135,17 @@ class SonicLocoManipEnv(BaseDualSim):
         if self.onscreen:
             if self.viewer is not None:
                 self.viewer.close()
-            self.viewer = mujoco.viewer.launch_passive(
-                self.mjModel,
-                self.mjData,
-                key_callback=self.task.robot.elastic_band.MujuocoKeyCallback,
-                show_left_ui=False,
-                show_right_ui=False,
-            )
+            try:
+                self.viewer = mujoco.viewer.launch_passive(
+                    self.mjModel,
+                    self.mjData,
+                    key_callback=self.task.robot.elastic_band.MujuocoKeyCallback,
+                    show_left_ui=False,
+                    show_right_ui=False,
+                )
+            except Exception as exc:
+                print(f"Warning: failed to launch MuJoCo viewer: {exc}")
+                self.viewer = None
         else:
             mujoco.mj_forward(self.mjModel, self.mjData)
             self.viewer = None

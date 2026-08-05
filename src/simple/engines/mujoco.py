@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     # from simple.sensors.config import CameraCfg
     
 
+import os
 import numpy as np
 from simple.core.simulator import Simulator
 
@@ -30,11 +31,36 @@ from simple.utils import resolve_data_path
 import mujoco
 
 from PIL import Image
-import os
 import cv2
 import transforms3d as t3d
 
 xyzw_to_wxyz = lambda q: np.array([q[3], q[0], q[1], q[2]])
+
+
+def _can_use_glfw(display_env: dict[str, str] | None = None, glfw_module=None) -> bool:
+    """Return True when a GUI-capable GLFW context is likely available."""
+    env = os.environ if display_env is None else display_env
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        return False
+
+    if glfw_module is None:
+        try:
+            import glfw as glfw_module
+        except Exception:
+            return False
+
+    try:
+        ok = bool(glfw_module.init())
+    except Exception:
+        return False
+
+    if ok:
+        try:
+            glfw_module.terminate()
+        except Exception:
+            pass
+    return ok
+
 
 class MujocoSimulator(Simulator):
 
@@ -54,7 +80,7 @@ class MujocoSimulator(Simulator):
         self.last_action = [0 for _ in range(17)]#TODO
 
         self.viewer = None
-        self.headless=headless
+        self.headless = headless or not _can_use_glfw()
         
         self.need_gravity = self.task.metadata.get("need_gravity", False)
         self._is_sonic = None
@@ -184,7 +210,6 @@ class MujocoSimulator(Simulator):
             name="ground",
             size=[0, 0, 1],
             pos=[0, 0, -z_minus],
-            material="groundplane"
         )
         # add some friction for contact stability
         ground.friction = [1.0, 0.005, 0.0001]  # [sliding, torsional, rolling]
@@ -262,12 +287,17 @@ class MujocoSimulator(Simulator):
             self.close()
 
         self.renderers = {}
-        for cname, camera in self.task.layout.cameras.items():
-            self.renderers[cname] = mujoco.Renderer(
-                self.mjModel,
-                height=camera.resolution[1],
-                width=camera.resolution[0]
-            ) # type: ignore
+        if not self.headless:
+            for cname, camera in self.task.layout.cameras.items():
+                try:
+                    self.renderers[cname] = mujoco.Renderer(
+                        self.mjModel,
+                        height=camera.resolution[1],
+                        width=camera.resolution[0]
+                    ) # type: ignore
+                except Exception as exc:
+                    print(f"Warning: failed to initialize renderer for camera {cname}: {exc}")
+                    self.renderers[cname] = None
 
         if not self._is_sonic:
             if self.viewer is not None:
@@ -275,8 +305,12 @@ class MujocoSimulator(Simulator):
 
             if not self.headless:
                 # This will display the int running physics
-                from mujoco import viewer
-                self.viewer = viewer.launch_passive(self.mjModel, self.mjData)
+                try:
+                    from mujoco import viewer
+                    self.viewer = viewer.launch_passive(self.mjModel, self.mjData)
+                except Exception as exc:
+                    print(f"Warning: failed to launch MuJoCo viewer: {exc}")
+                    self.viewer = None
             
         # ?. reset render step
         self.render_step = 0
@@ -286,42 +320,63 @@ class MujocoSimulator(Simulator):
 
         # TODO primitive types
         collision_meshes = actor.asset.collision_meshes_mujoco
-        num_convex = len(collision_meshes)
-
         label = actor.asset.uid
         name = actor.asset.uid
         if isinstance(actor.asset, SemanticAnnotated):
             label = actor.asset.label
             name = actor.asset.name
 
-        for i in range(num_convex):
-            mjSpec.add_mesh(
-                name=f'{label}_mesh_convex{i}', 
-                file=collision_meshes[i],
-            )
+        valid_mesh_paths = []
+        for i, mesh_path in enumerate(collision_meshes):
+            try:
+                resolved_mesh_path = resolve_data_path(mesh_path, auto_download=False)
+            except Exception:
+                resolved_mesh_path = mesh_path
 
-        mj_obj=mjWorld.add_body(
-            name=label, 
-            pos=actor.pose.position, 
+            if isinstance(resolved_mesh_path, str) and os.path.exists(resolved_mesh_path):
+                valid_mesh_paths.append((i, resolved_mesh_path))
+                mjSpec.add_mesh(
+                    name=f'{label}_mesh_convex{i}',
+                    file=resolved_mesh_path,
+                )
+            else:
+                print(f"Warning: missing collision mesh {mesh_path} for object {label}; using a fallback box geom.")
+
+        mj_obj = mjWorld.add_body(
+            name=label,
+            pos=actor.pose.position,
             quat=actor.pose.quaternion)
 
-
-        num_convex = len(collision_meshes)
-        for i in range(num_convex):
+        if not valid_mesh_paths:
             mj_obj.add_geom(
-                name=f"{label}_convex_{i}", 
-                meshname=f"{label}_mesh_convex{i}", 
+                name=f"{label}_fallback_box",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[0.05, 0.05, 0.05],
+                condim=4,
+                mass=0.1,
+                friction=[0.8, 0.05, 0.005],
+                rgba=[1, 1, 1, 1],
+                solref=[0.005, 2],
+            )
+            mj_obj.add_freejoint(name=f'{label}_joint')
+            return
+
+        num_convex = len(valid_mesh_paths)
+        for i, _ in valid_mesh_paths:
+            mj_obj.add_geom(
+                name=f"{label}_convex_{i}",
+                meshname=f"{label}_mesh_convex{i}",
                 type=mujoco.mjtGeom.mjGEOM_MESH,
-                # opposing slip in the tangent plane, rotation around the contact normal 
+                # opposing slip in the tangent plane, rotation around the contact normal
                 # and rotation around the two axes of the tangent plane
-                condim=4,  
+                condim=4,
                 # total mass 0.1 helps preventing slipping
-                mass=0.1/num_convex, 
-                # rubber on rough ground: large static, sliding and torisonal friction
-                friction=[0.8, 0.05, 0.005],  
+                mass=0.1 / num_convex,
+                # rubber on rough ground: large static, sliding and torsional friction
+                friction=[0.8, 0.05, 0.005],
                 rgba=[1, 1, 1, 1],
                 # stiff contact and no oscillation
-                solref = [0.005, 2]
+                solref=[0.005, 2],
             )
         mj_obj.add_freejoint(name=f'{label}_joint')
     
@@ -497,10 +552,13 @@ class MujocoSimulator(Simulator):
         elif camera.mount == "eye_in_head":
             torso_body = None
             for body in self.mj_worldbody.find_all('body'):
-                if body.name == "torso_link":
+                body_name = body.name or ""
+                if body_name == "torso_link" or body_name == "/torso_link" or body_name.endswith("torso_link"):
                     torso_body = body
                     break
-            assert torso_body is not None
+            if torso_body is None:
+                print(f"Warning: camera mount eye_in_head requested but torso_link was not found; skipping camera attachment for {cname}.")
+                return
             """ 
             I know this numbers look crazy!
             I obtain the first coordinate using isaacsim (g1_29dof_wholebody_dex3.usd)
@@ -617,8 +675,14 @@ class MujocoSimulator(Simulator):
 
         robot_geom_ids = self._robot_mask_geom_ids() if mask_camera_name is not None else set()
         for mjCamera in self.mj_worldbody.find_all('camera'):
-            renderer = self.renderers[mjCamera.name]
+            renderer = self.renderers.get(mjCamera.name)
             if renderer is None:
+                camera_cfg = self.task.layout.cameras.get(mjCamera.name)
+                if camera_cfg is None:
+                    resolution = (64, 64)
+                else:
+                    resolution = camera_cfg.resolution
+                image_observations[mjCamera.name] = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
                 continue
             
             # with self._telemetry.timer(f"render.updatescene.{mjCamera.name}"):

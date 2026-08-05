@@ -161,6 +161,29 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         self._stabilized = False
         self._stabilize_step_count = 0
 
+    def _resolve_body_name(self, mjModel, *candidates: str) -> str:
+        """Return the first existing body name across naming variants."""
+        for name in candidates:
+            try:
+                mjModel.body(name)
+                return name
+            except KeyError:
+                continue
+        raise KeyError(f"None of the body names exist: {candidates}")
+
+    def _resolve_body_id(self, mjModel, *candidates: str) -> int:
+        body_name = self._resolve_body_name(mjModel, *candidates)
+        return mjModel.body(body_name).id
+
+    def _resolve_named_data(self, getter, name: str):
+        """Resolve named MuJoCo data entries with or without '/' prefix."""
+        for candidate in (name, f"/{name}"):
+            try:
+                return getter(candidate)
+            except KeyError:
+                continue
+        raise KeyError(f"Name not found for data lookup: {name}")
+
     @property
     def stabilized(self) -> bool:
         """True once max(|floating-base qvel[0:6]|) drops below STABILIZE_VEL_THRESHOLD.
@@ -184,32 +207,36 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         self.mjModel = mjModel
 
         # adapted from base_sim.init_scene
-        self.torso_index = mujoco.mj_name2id(mjModel, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-        self.root_body = "pelvis"
+        self.torso_index = self._resolve_body_id(mjModel, "torso_link", "/torso_link")
+        self.root_body = self._resolve_body_name(mjModel, "pelvis", "/pelvis")
         self.root_body_id = mjModel.body(self.root_body).id
         self.joint_class_map = self._get_dof_indices_by_class(kwargs["mjSpec"], mjModel)
         self.perform_sysid_search = self.sonic_config.get("perform_sysid_search", False)
 
         # Check for static root link (fixed base)
-        self.use_floating_root_link = "floating_base_joint" in [
-            mjModel.joint(i).name for i in range(mjModel.njnt)
-        ]
-        self.use_constrained_root_link = "constrained_base_joint" in [
-            mjModel.joint(i).name for i in range(mjModel.njnt)
-        ]
+        model_joint_names = [mjModel.joint(i).name for i in range(mjModel.njnt)]
+        normalized_joint_names = [name.lstrip("/") for name in model_joint_names]
+        self.use_floating_root_link = "floating_base_joint" in normalized_joint_names
+        self.use_constrained_root_link = "constrained_base_joint" in normalized_joint_names
 
         # Enable the elastic band
         if self.sonic_config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
-            self.elastic_band = ElasticBand(point=np.array(self.spawn_pose.position[:2] + [1.0]))
+            band_point = np.array(self.spawn_pose.position[:2] + [1.0])
+            # Support both old ElasticBand(point=...) and new no-arg API.
+            try:
+                self.elastic_band = ElasticBand(point=band_point)
+            except TypeError:
+                self.elastic_band = ElasticBand()
+                self.elastic_band.point = band_point
             if "g1" in self.sonic_config["ROBOT_TYPE"]:
                 if self.sonic_config["enable_waist"]:
-                    self.band_attached_link = mjModel.body("pelvis").id
+                    self.band_attached_link = self._resolve_body_id(mjModel, "pelvis", "/pelvis")
                 else:
-                    self.band_attached_link = mjModel.body("torso_link").id
+                    self.band_attached_link = self._resolve_body_id(mjModel, "torso_link", "/torso_link")
             elif "h1" in self.sonic_config["ROBOT_TYPE"]:
-                self.band_attached_link = mjModel.body("torso_link").id
+                self.band_attached_link = self._resolve_body_id(mjModel, "torso_link", "/torso_link")
             else:
-                self.band_attached_link = mjModel.body("base_link").id
+                self.band_attached_link = self._resolve_body_id(mjModel, "base_link", "/base_link")
  
         # MuJoCo qpos/qvel arrays start with root DOFs before joint DOFs:
         # floating base has 7 qpos (pos + quat) and 6 qvel (lin + ang velocity)
@@ -231,16 +258,17 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         right_hand_index = []
         for i in range(self.mjModel.njnt):
             name = self.mjModel.joint(i).name
+            normalized_name = name.lstrip("/")
             if any(
                 [
-                    part_name in name
+                    part_name in normalized_name
                     for part_name in ["hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist"]
                 ]
-            ) and name in self.joint_names:
+            ) and normalized_name in self.joint_names:
                 body_joint_index.append(i)
-            elif "left_hand" in name:
+            elif "left_hand" in normalized_name:
                 left_hand_index.append(i)
-            elif "right_hand" in name:
+            elif "right_hand" in normalized_name:
                 right_hand_index.append(i)
         
         assert len(body_joint_index) == self.sonic_robot.NUM_JOINTS
@@ -255,8 +283,8 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         joints = {}
         
         for name in self.joint_names:
-            actuators[name] = mjData.actuator(name)
-            joints[name] = mjData.joint(name)
+            actuators[name] = self._resolve_named_data(mjData.actuator, name)
+            joints[name] = self._resolve_named_data(mjData.joint, name)
         
         self.joints=joints
         self.actuators=actuators
@@ -320,7 +348,7 @@ class G1Sonic(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
         obs["secondary_imu_quat"] = self.mjData.xquat[self.torso_index]
 
         pose = np.zeros(13)
-        torso_link = self.mjModel.body("torso_link").id
+        torso_link = self._resolve_body_id(self.mjModel, "torso_link", "/torso_link")
         # mj_objectVelocity returns [ang_vel, lin_vel]; swap to [lin_vel, ang_vel]
         mujoco.mj_objectVelocity(
             self.mjModel, self.mjData, mujoco.mjtObj.mjOBJ_BODY, torso_link, pose[7:13], 1

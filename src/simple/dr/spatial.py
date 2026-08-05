@@ -7,6 +7,7 @@ Licensed under the terms in LICENSE file.
 
 from __future__ import annotations
 
+import os
 import random
 from simple.core.actor import RobotActor , ObjectActor, ArticulatedObjectActor
 from simple.core.randomizer import Randomizer, RandomizerCfg
@@ -70,7 +71,7 @@ class SpatialDR(Randomizer):
         # self.cfg = cfg
         self.spatial_mode = cfg.spatial_mode
         self.fixed_stable_pose_idx = cfg.fixed_stable_pose_idx
-        # self._inner_state = {} # FIXME
+        self._inner_state = {}
 
     def state_dict(self) -> dict[str, Any]:
         return super().state_dict()
@@ -95,7 +96,11 @@ class SpatialDR(Randomizer):
             So table_height is only used to adjust the robot base height.
         
         """
-        self.collision_manager= trimesh.collision.CollisionManager()
+        try:
+            self.collision_manager = trimesh.collision.CollisionManager()
+        except ValueError:
+            self.collision_manager = None
+            print("Warning: trimesh FCL backend unavailable; continuing without collision manager.")
 
         # self._inner_state = {} # keep track of placed objects
         if self._inner_state is None:
@@ -238,8 +243,45 @@ class SpatialDR(Randomizer):
 
 
     def _random_place_one_object(self, obj: Object, region: Box, objtype: str, surface_height: float = 0.0):
-        
-        object_msh=trimesh.load_mesh(obj.asset.collision_mesh_curobo)
+        mesh_path = getattr(obj.asset, "collision_mesh_curobo", None)
+        if mesh_path is None or not os.path.exists(mesh_path):
+            print(f"Warning: missing mesh file for object {obj.uid} at {mesh_path}; placing it at a default position.")
+            p = np.zeros((3,), dtype=np.float32)
+            p[:2] += np.asarray(region.middle(), dtype=np.float32)
+            p[2] = surface_height + 0.05
+            obj.pose.position = p.tolist()
+            obj.pose.quaternion = [1.0, 0.0, 0.0, 0.0]
+            if objtype == "container":
+                self._inner_state[f"container_{obj.uid}"] = {
+                    "position": obj.pose.position,
+                    "quaternion": obj.pose.quaternion,
+                }
+            else:
+                self._inner_state[obj.uid] = {
+                    "position": obj.pose.position,
+                    "quaternion": obj.pose.quaternion,
+                }
+            return True
+
+        if self.collision_manager is None:
+            p = np.zeros((3,), dtype=np.float32)
+            p[:2] += np.asarray(region.middle(), dtype=np.float32)
+            p[2] = surface_height + 0.05
+            obj.pose.position = p.tolist()
+            obj.pose.quaternion = [1.0, 0.0, 0.0, 0.0]
+            if objtype == "container":
+                self._inner_state[f"container_{obj.uid}"] = {
+                    "position": obj.pose.position,
+                    "quaternion": obj.pose.quaternion,
+                }
+            else:
+                self._inner_state[obj.uid] = {
+                    "position": obj.pose.position,
+                    "quaternion": obj.pose.quaternion,
+                }
+            return True
+
+        object_msh=trimesh.load_mesh(mesh_path)
         for _ in range(100):
             if objtype == "container":
                 stable_pose = obj.asset.stable_poses[0] # only use the first stable pose for container

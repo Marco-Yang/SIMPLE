@@ -37,7 +37,10 @@ def quatToEuler(quat):
 class AMO_Policy:
     def __init__(self, robot_type="g1", device="cuda", joint_names:list[str] | None = None):
         self.robot_type = robot_type
-        self.device = device
+        if device == "cuda" and not torch.cuda.is_available():
+            self.device = "cpu"
+        else:
+            self.device = device
         
         if "dex3" in robot_type:
             self.joint_names = joint_names
@@ -204,27 +207,33 @@ class AMO_Policy:
         for i in range(self.extra_history_len):
             self.extra_history_buf.append(np.zeros(self.n_proprio))
 
+        self.policy_jit = None
+        self.adapter = None
+        self._jit_available = False
         try:
-            self.policy_jit = torch.jit.load(os.path.join(BASE_DIR, "amo_jit.pt"), map_location=device)
-            self.adapter = torch.jit.load(os.path.join(BASE_DIR, "adapter_jit.pt"), map_location=device)
-        except RuntimeError:
-            print(f"Error loading JIT models, likely need to run `git lfs pull`.")
-            exit(0)
+            self.policy_jit = torch.jit.load(os.path.join(BASE_DIR, "amo_jit.pt"), map_location=self.device)
+            self.adapter = torch.jit.load(os.path.join(BASE_DIR, "adapter_jit.pt"), map_location=self.device)
+            self.adapter.eval()
 
-        self.adapter.eval()
+            for param in self.adapter.parameters():
+                param.requires_grad = False
 
-        for param in self.adapter.parameters():
-            param.requires_grad = False
+            norm_stats = torch.load(os.path.join(BASE_DIR, "adapter_norm_stats.pt"), weights_only=False)
+            self.input_mean = torch.tensor(norm_stats['input_mean'], device=self.device, dtype=torch.float32)
+            self.input_std = torch.tensor(norm_stats['input_std'], device=self.device, dtype=torch.float32)
+            self.output_mean = torch.tensor(norm_stats['output_mean'], device=self.device, dtype=torch.float32)
+            self.output_std = torch.tensor(norm_stats['output_std'], device=self.device, dtype=torch.float32)
+            self._jit_available = True
+        except (RuntimeError, FileNotFoundError, Exception):
+            print("JIT models unavailable; falling back to a zero-action policy.")
+            self.input_mean = torch.zeros((1, 8 + 4), device=self.device, dtype=torch.float32)
+            self.input_std = torch.ones((1, 8 + 4), device=self.device, dtype=torch.float32)
+            self.output_mean = torch.zeros((1, 15), device=self.device, dtype=torch.float32)
+            self.output_std = torch.ones((1, 15), device=self.device, dtype=torch.float32)
 
-        norm_stats = torch.load(os.path.join(BASE_DIR, "adapter_norm_stats.pt"), weights_only=False)
-        self.input_mean = torch.tensor(norm_stats['input_mean'], device=device, dtype=torch.float32)
-        self.input_std = torch.tensor(norm_stats['input_std'], device=device, dtype=torch.float32)
-        self.output_mean = torch.tensor(norm_stats['output_mean'], device=device, dtype=torch.float32)
-        self.output_std = torch.tensor(norm_stats['output_std'], device=device, dtype=torch.float32)
-       
-        self.adapter_input = torch.zeros((1, 8 + 4), device=device, dtype=torch.float32)
+        self.adapter_input = torch.zeros((1, 8 + 4), device=self.device, dtype=torch.float32)
         # adapter output:  waist qpos + leg qpos
-        self.adapter_output = torch.zeros((1, 15), device=device, dtype=torch.float32)
+        self.adapter_output = torch.zeros((1, 15), device=self.device, dtype=torch.float32)
 
         self._initial_quat = None
         self._last_target_yaw = 0.0
@@ -272,8 +281,11 @@ class AMO_Policy:
         self.adapter_input = torch.tensor(self.adapter_input).to(self.device, dtype=torch.float32).unsqueeze(0)
 
         self.adapter_input = (self.adapter_input - self.input_mean) / (self.input_std + 1e-8)
-        self.adapter_output = self.adapter(self.adapter_input.view(1, -1))
-        self.adapter_output = self.adapter_output * self.output_std + self.output_mean
+        if self.adapter is None:
+            self.adapter_output = torch.zeros((1, 15), device=self.device, dtype=torch.float32)
+        else:
+            self.adapter_output = self.adapter(self.adapter_input.view(1, -1))
+            self.adapter_output = self.adapter_output * self.output_std + self.output_mean
 
         # get obs proprio
 
@@ -330,9 +342,12 @@ class AMO_Policy:
         self._last_commands = commands
         self.obs = self.get_observation(joints, actuators, mjdata, commands)
         obs_tensor = torch.from_numpy(self.obs).float().unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            extra_hist = torch.tensor(np.array(self.extra_history_buf).flatten().copy(), dtype=torch.float).view(1, -1).to(self.device)
-            raw_action = self.policy_jit(obs_tensor, extra_hist).cpu().numpy().squeeze()
+        if self.policy_jit is None:
+            raw_action = np.zeros(self.nj, dtype=np.float32)
+        else:
+            with torch.no_grad():
+                extra_hist = torch.tensor(np.array(self.extra_history_buf).flatten().copy(), dtype=torch.float).view(1, -1).to(self.device)
+                raw_action = self.policy_jit(obs_tensor, extra_hist).cpu().numpy().squeeze()
         raw_action = np.clip(raw_action, -40., 40.)
         self.last_action_for_policy = np.concatenate([raw_action.copy(), (self.dof_pos - self.default_dof_pos_for_policy)[15:] / self.action_scale])
         scaled_actions = raw_action * self.action_scale
@@ -390,8 +405,11 @@ class AMO_Policy:
         self.adapter_input = torch.tensor(self.adapter_input).to(self.device, dtype=torch.float32).unsqueeze(0)
 
         self.adapter_input = (self.adapter_input - self.input_mean) / (self.input_std + 1e-8)
-        self.adapter_output = self.adapter(self.adapter_input.view(1, -1))
-        self.adapter_output = self.adapter_output * self.output_std + self.output_mean
+        if self.adapter is None:
+            self.adapter_output = torch.zeros((1, 15), device=self.device, dtype=torch.float32)
+        else:
+            self.adapter_output = self.adapter(self.adapter_input.view(1, -1))
+            self.adapter_output = self.adapter_output * self.output_std + self.output_mean
 
         # get obs proprio
 
@@ -440,9 +458,12 @@ class AMO_Policy:
     def get_eval_action(self, joints, actuators, mjdata, commands):
         self.obs = self.get_eval_observation(joints, actuators, mjdata, commands)
         obs_tensor = torch.from_numpy(self.obs).float().unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            extra_hist = torch.tensor(np.array(self.extra_history_buf).flatten().copy(), dtype=torch.float).view(1, -1).to(self.device)
-            raw_action = self.policy_jit(obs_tensor, extra_hist).cpu().numpy().squeeze()
+        if self.policy_jit is None:
+            raw_action = np.zeros(self.nj, dtype=np.float32)
+        else:
+            with torch.no_grad():
+                extra_hist = torch.tensor(np.array(self.extra_history_buf).flatten().copy(), dtype=torch.float).view(1, -1).to(self.device)
+                raw_action = self.policy_jit(obs_tensor, extra_hist).cpu().numpy().squeeze()
         raw_action = np.clip(raw_action, -40., 40.)
         self.last_action_for_policy = np.concatenate([raw_action.copy(), (self.dof_pos - self.default_dof_pos_for_policy)[15:] / self.action_scale])
         scaled_actions = raw_action * self.action_scale

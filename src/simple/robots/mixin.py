@@ -17,6 +17,7 @@ import torch
 import numpy as np
 # from simple.mp.curobo import CuRoboPlanner
 
+_CUROBO_AVAILABLE = True
 try:
     # import curobo
     from curobo.types.base import TensorDeviceType
@@ -26,7 +27,8 @@ try:
     from curobo.util_file import join_path
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
 except ImportError:
-    raise RuntimeError("curobo not installed, uv pip install --groups curobo")
+    TensorDeviceType = Pose = IKSolver = RobotConfig = join_path = CudaRobotModel = None
+    _CUROBO_AVAILABLE = False
 
 
 class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
@@ -155,6 +157,8 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
     
     def _get_kinematic_model(self): # TODO DO NOT PUBLIC THIS FUNCTION
         if self._kin_model is None:
+            if not _CUROBO_AVAILABLE:
+                raise RuntimeError("curobo is not installed; install it to enable kinematics/planning")
             robot = cast("Robot", self)
             assert isinstance(robot.robot_cfg, dict)
             # urdf_file = robot.robot_cfg["kinematics"]["urdf_path"]  # Send global path starting with "/"
@@ -176,6 +180,8 @@ class CuRoboMixin(BatchPlannable, Controllable, Graspable, HasKinematics):
     
     def _create_empty_world_ik_solver(self): # TODO DO NOT PUBLIC THIS FUNCTION
         robot = cast("Robot", self)
+        if not _CUROBO_AVAILABLE:
+            raise RuntimeError("curobo is not installed; install it to enable IK")
         if self._ik_solver is None:
             ik_solver = IKSolver(IKSolver.load_from_robot_config(
                 robot.robot_cfg,

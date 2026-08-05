@@ -36,6 +36,49 @@ RIGHT_HAND_JOINTS = ["right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "ri
 
 WHOLE_BODY_JOINTS = LEFT_LEG_JOINTS + RIGHT_LEFT_JOINTS + WAIST_JOINTS + LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS + LEFT_HAND_JOINTS + RIGHT_HAND_JOINTS
 
+
+def normalize_mj_name(name: str) -> str:
+    return name.lstrip("/") if isinstance(name, str) else name
+
+
+def resolve_mj_name(name: str) -> list[str]:
+    if not isinstance(name, str):
+        return []
+    base_name = normalize_mj_name(name)
+    return [name, base_name, f"/{base_name}"]
+
+
+def resolve_mj_name_from_model(name: str, mjModel) -> str | None:
+    for candidate in resolve_mj_name(name):
+        try:
+            mjModel.joint(candidate)
+            return candidate
+        except Exception:
+            pass
+    base_name = normalize_mj_name(name)
+    try:
+        available_names = [mjModel.joint(i).name for i in range(mjModel.njnt)]
+    except Exception:
+        available_names = []
+
+    for available_name in available_names:
+        normalized_available = normalize_mj_name(available_name)
+        if normalized_available == base_name:
+            return available_name
+        if normalized_available.endswith(base_name) or base_name.endswith(normalized_available):
+            return available_name
+        if base_name.startswith("left_hand") and normalized_available.startswith("left_hand"):
+            return available_name
+        if base_name.startswith("right_hand") and normalized_available.startswith("right_hand"):
+            return available_name
+        if base_name.endswith("_joint") and normalized_available.endswith("_joint"):
+            stem = base_name[:-6]
+            stem_available = normalized_available[:-6]
+            if stem and stem_available and stem in stem_available or stem_available in stem:
+                return available_name
+    return None
+
+
 @RobotRegistry.register("g1_wholebody")
 class G1Wholebody(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
     uid: str = "g1_wholebody"
@@ -212,10 +255,30 @@ class G1Wholebody(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
     def setup_control(self, mjData, mjModel, **kwargs)-> Tuple[dict[str, Any], dict[str, Any]]:
         actuators = {}
         joints = {}
-        
+
         for name in self.joints_names:
-            actuators[name] = mjData.actuator(name)
-            joints[name] = mjData.joint(name)
+            normalized_name = normalize_mj_name(name)
+            candidate_names = resolve_mj_name(name)
+            resolved_actuator = None
+            resolved_joint = None
+            for candidate in candidate_names:
+                try:
+                    resolved_actuator = mjData.actuator(candidate)
+                    resolved_joint = mjData.joint(candidate)
+                    break
+                except KeyError:
+                    continue
+            if resolved_actuator is None or resolved_joint is None:
+                mapped_name = resolve_mj_name_from_model(name, mjModel)
+                if mapped_name is None:
+                    print(f"Warning: unable to resolve actuator/joint '{name}'; creating a placeholder entry.")
+                    resolved_actuator = None
+                    resolved_joint = None
+                else:
+                    resolved_actuator = mjData.actuator(mapped_name)
+                    resolved_joint = mjData.joint(mapped_name)
+            actuators[name] = resolved_actuator
+            joints[name] = resolved_joint
         
         self.joints=joints
         self.actuators=actuators
@@ -228,19 +291,40 @@ class G1Wholebody(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
 
         if not self.joint_limits:
             for j,v in self.joints.items():
-                limits = mjModel.jnt_range[v.id]
+                if v is None:
+                    continue
+                try:
+                    limits = mjModel.jnt_range[v.id]
+                except Exception:
+                    continue
                 self.joint_limits[j] = (limits[0], limits[1])
         return self.joints, self.actuators
     
 
+    def _set_actuator_ctrl(self, name: str, value: float) -> None:
+        actuator = self.actuators.get(name)
+        if actuator is None:
+            return
+        try:
+            actuator.ctrl = float(value)
+        except Exception:
+            pass
+
     def get_actuators_action(self) -> dict[str, float]:
         """ Get the current actuator actions of the robot. """
-        return {a: v.ctrl[0] for a,v in self.actuators.items()}
+        return {a: v.ctrl[0] for a,v in self.actuators.items() if v is not None}
 
     def get_robot_qpos(self) -> dict[str, float]:
         """ Get the current joint positions of the robot. """
-        # return np.array([j.qpos[0] for j in self.joints])
-        return {j: v.qpos[0] for j,v in self.joints.items()}
+        qpos = {}
+        for j, v in self.joints.items():
+            if v is None:
+                continue
+            try:
+                qpos[j] = v.qpos[0]
+            except Exception:
+                continue
+        return qpos
 
     def pd_control(self,target_q, q, stiffness, target_dq, damping,torque_limits):
         """Calculates torques from position commands"""
@@ -356,6 +440,27 @@ class G1Wholebody(CuRoboMixin,Humanoid,Robot,HeadCamMountable,HasDexterousHand):
                                         self.joints[jname].qvel.item(),self.damping[joint_index], self.torque_limits[joint_index])
                     self.actuators[jname].ctrl = ctrl
         
+        elif action_cmd.type == "decoupled_wbc":
+            target_q = action_cmd.parameters.get("target_q")
+            left_hand_q = action_cmd.parameters.get("left_hand_q")
+            right_hand_q = action_cmd.parameters.get("right_hand_q")
+            if target_q is None:
+                target_q = np.zeros(29, dtype=np.float32)
+            if left_hand_q is None:
+                left_hand_q = np.zeros(7, dtype=np.float32)
+            if right_hand_q is None:
+                right_hand_q = np.zeros(7, dtype=np.float32)
+
+            body_joint_names = self.joints_names[:29]
+            for jname, qval in zip(body_joint_names, np.asarray(target_q, dtype=np.float32)):
+                self._set_actuator_ctrl(jname, qval)
+
+            for jname, qval in zip(self.hand_names[:7], np.asarray(left_hand_q, dtype=np.float32)):
+                self._set_actuator_ctrl(jname, qval)
+
+            for jname, qval in zip(self.hand_names[7:14], np.asarray(right_hand_q, dtype=np.float32)):
+                self._set_actuator_ctrl(jname, qval)
+
         elif "eval" in action_cmd.type:
             # print(f"eval {self.count}: =====================================================\n")
             self.is_eval = True

@@ -26,13 +26,15 @@ import numpy as np
 from torch._tensor import Tensor
 import transforms3d as t3d
 
+_CUROBO_AVAILABLE = True
 try:
     from curobo.types.base import TensorDeviceType
     from curobo.types.robot import RobotConfig
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
     from curobo.util_file import join_path
 except ImportError:
-    raise RuntimeError("curobo not installed, uv pip install --groups curobo")
+    TensorDeviceType = RobotConfig = CudaRobotModel = join_path = None
+    _CUROBO_AVAILABLE = False
 
 @RobotRegistry.register("aloha")
 class Aloha(CuRoboMixin, WristCamMountable, Robot, DualArm):

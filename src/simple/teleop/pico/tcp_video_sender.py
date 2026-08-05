@@ -115,7 +115,9 @@ class TCPVideoSender:
         self._encoder.options = {
             "tune": "zerolatency",
             "preset": "ultrafast",
-            "x264-params": "keyint=15:min-keyint=15",
+            "profile": "baseline",
+            # Ensure Android-side decoders can lock stream quickly and parse NAL units reliably.
+            "x264-params": "keyint=15:min-keyint=15:repeat-headers=1:annexb=1",
         }
         self._encoder.open()
         print(
