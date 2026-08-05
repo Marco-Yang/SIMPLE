@@ -580,12 +580,6 @@ def main(
                                         f"count={done_signal_count}"
                                     )
                                     rec_state = RecordingState.EPISODE_DONE
-                                else:
-                                    print(
-                                        "[PassiveReset] episode done signal ignored "
-                                        f"(terminated={terminated}, truncated={truncated}, "
-                                        f"count={done_signal_count}, disabled by SIMPLE_PASSIVE_RESET_ON_DONE=0)"
-                                    )
 
                     if rec_state == RecordingState.EPISODE_DONE:
                         # Close progress bar for this episode
